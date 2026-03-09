@@ -36,5 +36,8 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      - name: Verify locked native dependencies
+        run: yarn verify:native-deps
+
       - name: Build project
         run: yarn build

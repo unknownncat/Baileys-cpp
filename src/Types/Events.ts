@@ -16,7 +16,6 @@ import type { LabelAssociation } from './LabelAssociation'
 import type { MessageUpsertType, MessageUserReceiptUpdate, WAMessage, WAMessageKey, WAMessageUpdate } from './Message'
 import type { ConnectionState } from './State'
 
-// TODO: refactor this mess
 export type BaileysEventMap = {
 	/** connection state has been updated -- WS closed, opened, connecting etc. */
 	'connection.update': Partial<ConnectionState>
@@ -90,6 +89,19 @@ export type BaileysEventMap = {
 
 	'blocklist.set': { blocklist: string[] }
 	'blocklist.update': { blocklist: string[]; type: 'add' | 'remove' }
+	'devices.update': {
+		jid?: string
+		lid?: string
+		hash?: string
+		phash?: string
+		ts?: number
+		devices: {
+			id?: string
+			lid?: string
+			keyIndex?: number
+			isHosted?: boolean
+		}[]
+	}
 
 	/** Receive an update on a call, including when the call was received, rejected, accepted */
 	call: WACallEvent[]
@@ -105,6 +117,11 @@ export type BaileysEventMap = {
 	'newsletter.view': { id: string; server_id: string; count: number }
 	'newsletter-participants.update': { id: string; author: string; user: string; new_role: string; action: string }
 	'newsletter-settings.update': { id: string; update: any }
+	'peer-data-operation.response': {
+		requestId?: string
+		requestType?: proto.Message.PeerDataOperationRequestType
+		results: proto.Message.PeerDataOperationRequestResponseMessage.IPeerDataOperationResult[]
+	}
 
 	/** Settings and actions sync events */
 	'chats.lock': { id: string; locked: boolean }

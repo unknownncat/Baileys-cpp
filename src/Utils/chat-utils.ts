@@ -1,6 +1,11 @@
 import { Boom } from '@hapi/boom'
 import { expandAppStateKeys } from 'whatsapp-rust-bridge'
 import { proto } from '../../WAProto/index.js'
+import {
+	type NativeDerivedMutationKey,
+	type NativeSyncdMutationFastInput,
+	requireNativeExport
+} from '../Native/baileys-native'
 import type {
 	BaileysEventEmitter,
 	Chat,
@@ -20,16 +25,27 @@ import {
 	type MessageLabelAssociation
 } from '../Types/LabelAssociation'
 import { type BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, isJidGroup, jidNormalizedUser } from '../WABinary'
-import { aesDecrypt, aesEncrypt, hmacSign } from './crypto'
+import { aesEncrypt, hmacSign } from './crypto'
 import { toNumber } from './generics'
 import type { ILogger } from './logger'
 import { LT_HASH_ANTI_TAMPERING } from './lt-hash'
-import { downloadContentFromMessage } from './messages-media'
+import { downloadContentFromMessage, toBuffer } from './messages-media'
 import { emitSyncActionResults, processContactAction } from './sync-action-utils'
 
 type FetchAppStateSyncKey = (keyId: string) => Promise<proto.Message.IAppStateSyncKeyData | null | undefined>
 
 export type ChatMutationMap = { [index: string]: ChatMutation }
+
+const nativeBuildMutationMacPayload = requireNativeExport('buildMutationMacPayload')
+const nativeBuildSnapshotMacPayload = requireNativeExport('buildSnapshotMacPayload')
+const nativeBuildPatchMacPayload = requireNativeExport('buildPatchMacPayload')
+const nativeEncodeSyncActionData = requireNativeExport('encodeSyncActionData')
+const nativeEncodeSyncdPatchRaw = requireNativeExport('encodeSyncdPatchRaw')
+const nativeDecodeSyncdPatchRaw = requireNativeExport('decodeSyncdPatchRaw')
+const nativeDecodeSyncdSnapshotRaw = requireNativeExport('decodeSyncdSnapshotRaw')
+const nativeDecodeSyncdMutationsRaw = requireNativeExport('decodeSyncdMutationsRaw')
+const nativeDecodeSyncdMutationsFastWire = requireNativeExport('decodeSyncdMutationsFastWire')
+const nativeParseJsonStringArrayFast = requireNativeExport('parseJsonStringArrayFast')
 
 const mutationKeys = (keydata: Uint8Array) => {
 	const keys = expandAppStateKeys(keydata)
@@ -50,26 +66,9 @@ const generateMac = (
 ) => {
 	const opByte = operation === proto.SyncdMutation.SyncdOperation.SET ? 0x01 : 0x02
 	const keyIdBuffer = typeof keyId === 'string' ? Buffer.from(keyId, 'base64') : keyId
-	const keyData = new Uint8Array(1 + keyIdBuffer.length)
-	keyData[0] = opByte
-	keyData.set(keyIdBuffer, 1)
-
-	const last = new Uint8Array(8)
-	last[7] = keyData.length
-
-	const total = new Uint8Array(keyData.length + data.length + last.length)
-	total.set(keyData, 0)
-	total.set(data, keyData.length)
-	total.set(last, keyData.length + data.length)
-
-	const hmac = hmacSign(total, key, 'sha512')
+	const payload = nativeBuildMutationMacPayload(opByte === 0x01 ? 0 : 1, data, keyIdBuffer)
+	const hmac = hmacSign(payload, key, 'sha512')
 	return hmac.subarray(0, 32)
-}
-
-const to64BitNetworkOrder = (e: number) => {
-	const buff = Buffer.alloc(8)
-	buff.writeUint32BE(e, 4)
-	return buff
 }
 
 type Mac = { indexMac: Uint8Array; valueMac: Uint8Array; operation: proto.SyncdMutation.SyncdOperation }
@@ -111,9 +110,50 @@ const makeLtHashGenerator = ({ indexValueMap, hash }: Pick<LTHashState, 'hash' |
 	}
 }
 
+const encodeSyncActionDataWire = (
+	index: Uint8Array,
+	value: proto.ISyncActionValue,
+	version: number,
+	padding: Uint8Array = new Uint8Array(0)
+) => {
+	const encodedValue = proto.SyncActionValue.encode(value).finish()
+	return nativeEncodeSyncActionData(index, encodedValue, version, padding)
+}
+
+export const encodeSyncdPatchWire = (patch: proto.ISyncdPatch): Uint8Array => {
+	return nativeEncodeSyncdPatchRaw(patch)
+}
+
+const decodeSyncdPatchWire = (data: Uint8Array): proto.ISyncdPatch => {
+	const decoded = nativeDecodeSyncdPatchRaw(data)
+	if (decoded) {
+		return decoded as proto.ISyncdPatch
+	}
+
+	throw new Boom('native decodeSyncdPatchRaw returned invalid payload', { statusCode: 500 })
+}
+
+const decodeSyncdSnapshotWire = (data: Uint8Array): proto.ISyncdSnapshot => {
+	const decoded = nativeDecodeSyncdSnapshotRaw(data)
+	if (decoded) {
+		return decoded as proto.ISyncdSnapshot
+	}
+
+	throw new Boom('native decodeSyncdSnapshotRaw returned invalid payload', { statusCode: 500 })
+}
+
+const decodeSyncdMutationsWire = (data: Uint8Array): proto.ISyncdMutations => {
+	const decoded = nativeDecodeSyncdMutationsRaw(data)
+	if (decoded) {
+		return decoded as proto.ISyncdMutations
+	}
+
+	throw new Boom('native decodeSyncdMutationsRaw returned invalid payload', { statusCode: 500 })
+}
+
 const generateSnapshotMac = (lthash: Uint8Array, version: number, name: WAPatchName, key: Uint8Array) => {
-	const total = Buffer.concat([lthash, to64BitNetworkOrder(version), Buffer.from(name, 'utf-8')])
-	return hmacSign(total, key, 'sha256')
+	const payload = nativeBuildSnapshotMacPayload(lthash, version, name)
+	return hmacSign(payload, key, 'sha256')
 }
 
 const generatePatchMac = (
@@ -123,8 +163,8 @@ const generatePatchMac = (
 	type: WAPatchName,
 	key: Uint8Array
 ) => {
-	const total = Buffer.concat([snapshotMac, ...valueMacs, to64BitNetworkOrder(version), Buffer.from(type, 'utf-8')])
-	return hmacSign(total, key)
+	const payload = nativeBuildPatchMacPayload(snapshotMac, valueMacs, version, type)
+	return hmacSign(payload, key)
 }
 
 export const newLTHashState = (): LTHashState => ({ version: 0, hash: Buffer.alloc(128), indexValueMap: {} })
@@ -145,13 +185,7 @@ export const encodeSyncdPatch = async (
 	state = { ...state, indexValueMap: { ...state.indexValueMap } }
 
 	const indexBuffer = Buffer.from(JSON.stringify(index))
-	const dataProto = proto.SyncActionData.fromObject({
-		index: indexBuffer,
-		value: syncAction,
-		padding: new Uint8Array(0),
-		version: apiVersion
-	})
-	const encoded = proto.SyncActionData.encode(dataProto).finish()
+	const encoded = encodeSyncActionDataWire(indexBuffer, syncAction, apiVersion)
 
 	const keyValue = mutationKeys(key.keyData!)
 
@@ -203,45 +237,95 @@ export const decodeSyncdMutations = async (
 ) => {
 	const ltGenerator = makeLtHashGenerator(initialState)
 	const derivedKeyCache = new Map<string, ReturnType<typeof mutationKeys>>()
+	const parsedIndexCache = new Map<string, unknown>()
+	const hydrateParsedIndexCache = (indexes: readonly string[]) => {
+		const uncached = indexes.filter(index => !parsedIndexCache.has(index))
+		if (!uncached.length) {
+			return
+		}
 
-	// indexKey used to HMAC sign record.index.blob
-	// valueEncryptionKey used to AES-256-CBC encrypt record.value.blob[0:-32]
-	// the remaining record.value.blob[0:-32] is the mac, it the HMAC sign of key.keyId + decoded proto data + length of bytes in keyId
+		const parsedValues = nativeParseJsonStringArrayFast(uncached)
+		if (!Array.isArray(parsedValues) || parsedValues.length !== uncached.length) {
+			throw new Boom('native parseJsonStringArrayFast returned invalid payload', { statusCode: 500 })
+		}
+
+		for (let i = 0; i < uncached.length; i += 1) {
+			parsedIndexCache.set(uncached[i]!, parsedValues[i])
+		}
+	}
+
+	const parseIndex = (index: Uint8Array, indexString?: string) => {
+		const indexStr = indexString ?? Buffer.from(index).toString()
+		if (parsedIndexCache.has(indexStr)) {
+			return { indexStr, index: parsedIndexCache.get(indexStr) }
+		}
+
+		const parsed = JSON.parse(indexStr)
+		parsedIndexCache.set(indexStr, parsed)
+		return { indexStr, index: parsed }
+	}
+
+	const decodeSyncActionValue = (value: unknown): proto.ISyncActionValue => {
+		if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
+			return proto.SyncActionValue.decode(value)
+		}
+
+		return proto.SyncActionValue.fromObject(value as proto.ISyncActionValue)
+	}
+
+	if (!msgMutations.length) {
+		return ltGenerator.finish()
+	}
+
+	const fastMutations: NativeSyncdMutationFastInput[] = []
+	const keyMap: Record<string, NativeDerivedMutationKey> = {}
+
 	for (const msgMutation of msgMutations) {
-		// if it's a syncdmutation, get the operation property
-		// otherwise, if it's only a record -- it'll be a SET mutation
 		const operation = 'operation' in msgMutation ? msgMutation.operation : proto.SyncdMutation.SyncdOperation.SET
 		const record =
 			'record' in msgMutation && !!msgMutation.record ? msgMutation.record : (msgMutation as proto.ISyncdRecord)
 
-		const key = await getKey(record.keyId!.id!)
-		const content = record.value!.blob!
-		const encContent = content.subarray(0, -32)
-		const ogValueMac = content.subarray(-32)
-		if (validateMacs) {
-			const contentHmac = generateMac(operation!, encContent, record.keyId!.id!, key.valueMacKey)
-			if (Buffer.compare(contentHmac, ogValueMac) !== 0) {
-				throw new Boom('HMAC content verification failed')
-			}
+		const keyId = record.keyId!.id!
+		const base64Key = Buffer.from(keyId).toString('base64')
+		const key = await getKey(keyId)
+		keyMap[base64Key] = key
+		fastMutations.push({
+			operation: operation!,
+			indexMac: record.index!.blob!,
+			valueBlob: record.value!.blob!,
+			keyId
+		})
+	}
+
+	const decodedMutations = nativeDecodeSyncdMutationsFastWire(fastMutations, keyMap, validateMacs)
+	if (!Array.isArray(decodedMutations) || decodedMutations.length !== fastMutations.length) {
+		throw new Boom('native decodeSyncdMutationsFastWire returned invalid payload', { statusCode: 500 })
+	}
+
+	const indexStrings = decodedMutations.map(mutation => {
+		if (typeof mutation?.syncAction?.indexString === 'string') {
+			return mutation.syncAction.indexString
 		}
 
-		const result = aesDecrypt(encContent, key.valueEncryptionKey)
-		const syncAction = proto.SyncActionData.decode(result)
+		return Buffer.from(mutation.syncAction.index).toString()
+	})
+	hydrateParsedIndexCache(indexStrings)
 
-		if (validateMacs) {
-			const hmac = hmacSign(syncAction.index!, key.indexKey)
-			if (Buffer.compare(hmac, record.index!.blob!) !== 0) {
-				throw new Boom('HMAC index verification failed')
-			}
+	for (const mutation of decodedMutations) {
+		const syncAction: proto.ISyncActionData = {
+			index: mutation.syncAction.index,
+			value: decodeSyncActionValue(mutation.syncAction.value),
+			padding: mutation.syncAction.padding ?? new Uint8Array(0),
+			version: typeof mutation.syncAction.version === 'number' ? mutation.syncAction.version : undefined
 		}
 
-		const indexStr = Buffer.from(syncAction.index!).toString()
-		onMutation({ syncAction, index: JSON.parse(indexStr) })
+		const { index } = parseIndex(syncAction.index!, mutation.syncAction.indexString)
+		onMutation({ syncAction, index })
 
 		ltGenerator.mix({
-			indexMac: record.index!.blob!,
-			valueMac: ogValueMac,
-			operation: operation!
+			indexMac: mutation.indexMac,
+			valueMac: mutation.valueMac,
+			operation: mutation.operation as proto.SyncdMutation.SyncdOperation
 		})
 	}
 
@@ -324,13 +408,13 @@ export const extractSyncdPatches = async (result: BinaryNode, options: RequestIn
 
 			let snapshot: proto.ISyncdSnapshot | undefined = undefined
 			if (snapshotNode && !!snapshotNode.content) {
-				if (!Buffer.isBuffer(snapshotNode)) {
+				if (!Buffer.isBuffer(snapshotNode.content)) {
 					snapshotNode.content = Buffer.from(Object.values(snapshotNode.content))
 				}
 
 				const blobRef = proto.ExternalBlobReference.decode(snapshotNode.content as Buffer)
 				const data = await downloadExternalBlob(blobRef, options)
-				snapshot = proto.SyncdSnapshot.decode(data)
+				snapshot = decodeSyncdSnapshotWire(data)
 			}
 
 			for (let { content } of patches) {
@@ -339,7 +423,7 @@ export const extractSyncdPatches = async (result: BinaryNode, options: RequestIn
 						content = Buffer.from(Object.values(content))
 					}
 
-					const syncd = proto.SyncdPatch.decode(content as Uint8Array)
+					const syncd = decodeSyncdPatchWire(content as Uint8Array)
 					if (!syncd.version) {
 						syncd.version = { version: +collectionNode.attrs.version! + 1 }
 					}
@@ -357,17 +441,12 @@ export const extractSyncdPatches = async (result: BinaryNode, options: RequestIn
 
 export const downloadExternalBlob = async (blob: proto.IExternalBlobReference, options: RequestInit) => {
 	const stream = await downloadContentFromMessage(blob, 'md-app-state', { options })
-	const bufferArray: Buffer[] = []
-	for await (const chunk of stream) {
-		bufferArray.push(chunk)
-	}
-
-	return Buffer.concat(bufferArray)
+	return toBuffer(stream)
 }
 
 export const downloadExternalPatch = async (blob: proto.IExternalBlobReference, options: RequestInit) => {
 	const buffer = await downloadExternalBlob(blob, options)
-	const syncData = proto.SyncdMutations.decode(buffer)
+	const syncData = decodeSyncdMutationsWire(buffer)
 	return syncData
 }
 
@@ -441,8 +520,13 @@ export const decodePatches = async (
 		if (syncd.externalMutations) {
 			logger?.trace({ name, version }, 'downloading external patch')
 			const ref = await downloadExternalPatch(syncd.externalMutations, options)
-			logger?.debug({ name, version, mutations: ref.mutations.length }, 'downloaded external patch')
-			syncd.mutations?.push(...ref.mutations)
+			const externalMutations = ref.mutations || []
+			logger?.debug({ name, version, mutations: externalMutations.length }, 'downloaded external patch')
+			if (!syncd.mutations) {
+				syncd.mutations = []
+			}
+
+			syncd.mutations.push(...externalMutations)
 		}
 
 		const patchVersion = toNumber(version!.version)

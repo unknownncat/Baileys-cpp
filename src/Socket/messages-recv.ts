@@ -10,6 +10,7 @@ import {
 	PLACEHOLDER_MAX_AGE_SECONDS,
 	STATUS_EXPIRY_SECONDS
 } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	GroupParticipant,
 	MessageReceiptType,
@@ -21,7 +22,7 @@ import type {
 	WAMessageKey,
 	WAPatchName
 } from '../Types'
-import { WAMessageStatus, WAMessageStubType } from '../Types'
+import { DisconnectReason, WAMessageStatus, WAMessageStubType } from '../Types'
 import {
 	aesDecryptCTR,
 	aesEncryptGCM,
@@ -29,6 +30,7 @@ import {
 	Curve,
 	decodeMediaRetryNode,
 	decodeMessageNode,
+	decodeWAMessage,
 	decryptMessageNode,
 	delay,
 	derivePairingCodeKey,
@@ -36,6 +38,7 @@ import {
 	encodeSignedDeviceIdentity,
 	extractAddressingContext,
 	getCallStatusFromNode,
+	getDecryptRuntimeState,
 	getHistoryMsg,
 	getNextPreKeys,
 	getStatusFromReceiptType,
@@ -44,6 +47,7 @@ import {
 	MISSING_KEYS_ERROR_TEXT,
 	NACK_REASONS,
 	NO_MESSAGE_FOUND_ERROR_TEXT,
+	RetryReason,
 	toNumber,
 	unixTimestampSeconds,
 	xmppPreKey,
@@ -59,6 +63,8 @@ import {
 	getBinaryNodeChildBuffer,
 	getBinaryNodeChildren,
 	getBinaryNodeChildString,
+	isHostedLidUser,
+	isHostedPnUser,
 	isJidGroup,
 	isJidNewsletter,
 	isJidStatusBroadcast,
@@ -70,6 +76,8 @@ import {
 } from '../WABinary'
 import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
+
+const nativeEncodeGroupParticipantStubsFast = requireNativeExport('encodeGroupParticipantStubsFast')
 
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const { logger, retryRequestDelayMs, maxMsgRetryCount, getMessage, shouldIgnoreJid, enableAutoSessionRecreation } =
@@ -98,6 +106,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
 	const retryMutex = makeMutex()
+	const PREKEY_UPLOAD_COOLDOWN_MS = 15_000
+	let lastPreKeyUploadAt = 0
 
 	const msgRetryCache =
 		config.msgRetryCounterCache ||
@@ -119,10 +129,197 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			useClones: false
 		})
 
+	type AckRecoveryState = {
+		attempts: number
+		nextRetryAt: number
+		lastError: string
+		updatedAt: number
+	}
+
+	const ACK_RECOVERY_CACHE_PREFIX = 'ack-recovery'
+	const ACK_RECOVERY_RETRYABLE_ERRORS = new Set(['479', '500'])
+	const ACK_RECOVERY_MAX_ATTEMPTS = 3
+	const ACK_RECOVERY_COOLDOWN_MS = 20_000
+	const inFlightAckRecovery = new Set<string>()
+
+	const getAckRecoveryCacheKey = (remoteJid: string, msgId: string) =>
+		`${ACK_RECOVERY_CACHE_PREFIX}:${remoteJid}:${msgId}`
+
+	const getAckRecoveryState = async (remoteJid: string, msgId: string) => {
+		const value = await placeholderResendCache.get(getAckRecoveryCacheKey(remoteJid, msgId))
+		if (!value || typeof value !== 'object') {
+			return undefined
+		}
+
+		return value as AckRecoveryState
+	}
+
+	const setAckRecoveryState = async (remoteJid: string, msgId: string, state: AckRecoveryState) => {
+		await placeholderResendCache.set(getAckRecoveryCacheKey(remoteJid, msgId), state)
+	}
+
+	const clearAckRecoveryState = async (remoteJid: string, msgId: string) => {
+		await placeholderResendCache.del(getAckRecoveryCacheKey(remoteJid, msgId))
+	}
+
+	const attemptAckErrorRecovery = async (attrs: BinaryNode['attrs'], key: WAMessageKey) => {
+		const errorCode = `${attrs.error || ''}`
+		if (!ACK_RECOVERY_RETRYABLE_ERRORS.has(errorCode) || !key.remoteJid || !key.id) {
+			return
+		}
+
+		const cacheKey = getAckRecoveryCacheKey(key.remoteJid, key.id)
+		if (inFlightAckRecovery.has(cacheKey)) {
+			return
+		}
+
+		inFlightAckRecovery.add(cacheKey)
+		try {
+			const now = Date.now()
+			const existing = await getAckRecoveryState(key.remoteJid, key.id)
+			if (existing?.attempts && existing.attempts >= ACK_RECOVERY_MAX_ATTEMPTS) {
+				logger.info(
+					{ key, errorCode, attempts: existing.attempts },
+					'skipping ack error recovery because max attempts was reached'
+				)
+				ev.emit('messages.update', [
+					{
+						key,
+						update: {
+							status: WAMessageStatus.ERROR,
+							messageStubParameters: [errorCode]
+						}
+					}
+				])
+				return
+			}
+
+			if (existing?.nextRetryAt && existing.nextRetryAt > now) {
+				logger.debug(
+					{ key, errorCode, nextRetryAt: existing.nextRetryAt },
+					'skipping ack error recovery due to cooldown'
+				)
+				return
+			}
+
+			const nextAttempts = (existing?.attempts || 0) + 1
+			await setAckRecoveryState(key.remoteJid, key.id, {
+				attempts: nextAttempts,
+				nextRetryAt: now + ACK_RECOVERY_COOLDOWN_MS,
+				lastError: errorCode,
+				updatedAt: now
+			})
+
+			let originalMsg: proto.IMessage | undefined
+			if (messageRetryManager) {
+				const cached = messageRetryManager.getRecentMessage(key.remoteJid, key.id)
+				if (cached) {
+					originalMsg = cached.message
+				}
+			}
+
+			if (!originalMsg) {
+				originalMsg = await getMessage(key)
+			}
+
+			if (!originalMsg) {
+				logger.warn({ key, errorCode }, 'ack recovery skipped because original message was not found')
+				return
+			}
+
+			const relayOptions: MessageRelayOptions = {
+				messageId: key.id,
+				useUserDevicesCache: false
+			}
+
+			if (attrs.participant) {
+				relayOptions.participant = {
+					jid: attrs.participant,
+					count: 1
+				}
+			} else if (!isJidGroup(key.remoteJid)) {
+				relayOptions.additionalAttributes = {
+					device_fanout: 'false'
+				}
+			}
+
+			await relayMessage(key.remoteJid, originalMsg, relayOptions)
+			logger.info({ key, errorCode, attempts: nextAttempts }, 'resent message after retryable ack error')
+		} catch (error) {
+			logger.warn({ key, errorCode, error }, 'failed to run ack error recovery')
+		} finally {
+			inFlightAckRecovery.delete(cacheKey)
+		}
+	}
+
+	const getRetryReasonFromDecryptError = (errorMessage: string): RetryReason => {
+		const normalized = errorMessage.toLowerCase()
+		if (normalized.includes('invalid prekey id')) {
+			return RetryReason.SignalErrorInvalidKeyId
+		}
+
+		if (normalized.includes('invalid prekey') || normalized.includes('prekey')) {
+			return RetryReason.SignalErrorInvalidKey
+		}
+
+		if (normalized.includes('no session')) {
+			return RetryReason.SignalErrorNoSession
+		}
+
+		if (
+			normalized.includes('invalidmessageexception') ||
+			normalized.includes('bad mac') ||
+			normalized.includes('mac')
+		) {
+			return normalized.includes('bad mac') ? RetryReason.SignalErrorBadMac : RetryReason.SignalErrorInvalidMessage
+		}
+
+		return RetryReason.UnknownError
+	}
+
 	// Debounce identity-change session refreshes per JID to avoid bursts
 	const identityAssertDebounce = new NodeCache<boolean>({ stdTTL: 5, useClones: false })
 
 	let sendActiveReceipts = false
+
+	const encodeGroupParticipantStubs = (participants: GroupParticipant[]) => {
+		const encoded = nativeEncodeGroupParticipantStubsFast(participants)
+		if (
+			Array.isArray(encoded) &&
+			encoded.length === participants.length &&
+			encoded.every(item => typeof item === 'string')
+		) {
+			return encoded
+		}
+
+		throw new Boom('native encodeGroupParticipantStubsFast returned invalid payload', { statusCode: 500 })
+	}
+
+	const isLidLike = (jid: string | null | undefined): boolean =>
+		!!(isLidUser(jid || undefined) || isHostedLidUser(jid || undefined))
+	const isPnLike = (jid: string | null | undefined): boolean =>
+		!!(isPnUser(jid || undefined) || isHostedPnUser(jid || undefined))
+
+	const storeLidPnMappings = async (pairs: Array<{ lid?: string; pn?: string }>) => {
+		const valid = pairs.filter(
+			(pair): pair is { lid: string; pn: string } =>
+				!!pair?.lid && !!pair?.pn && isLidLike(pair.lid) && isPnLike(pair.pn)
+		)
+		if (!valid.length) {
+			return
+		}
+
+		const dedup = new Map<string, { lid: string; pn: string }>()
+		for (const pair of valid) {
+			dedup.set(`${pair.lid}|${pair.pn}`, pair)
+		}
+
+		try {
+			await signalRepository.lidMapping.storeLIDPNMappings(Array.from(dedup.values()))
+		} catch (error) {
+			logger.warn({ error, count: dedup.size }, 'failed to store LID mappings from notification')
+		}
+	}
 
 	const fetchMessageHistory = async (
 		count: number,
@@ -317,12 +514,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							typeof plaintextNode.content === 'string'
 								? Buffer.from(plaintextNode.content, 'binary')
 								: Buffer.from(plaintextNode.content as Uint8Array)
-						const messageProto = proto.Message.decode(contentBuf).toJSON()
+						const messageProto = decodeWAMessage(contentBuf, false)
 						const fullMessage = proto.WebMessageInfo.fromObject({
 							key: {
 								remoteJid: from,
 								id: child.attrs.message_id || child.attrs.server_id,
-								fromMe: false // TODO: is this really true though
+								fromMe:
+									areJidsSameUser(author, authState.creds.me?.id) || areJidsSameUser(author, authState.creds.me?.lid),
+								participant: author
 							},
 							message: messageProto,
 							messageTimestamp: +child.attrs.t!
@@ -401,17 +600,65 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		await query(stanza)
 	}
 
-	const sendRetryRequest = async (node: BinaryNode, forceIncludeKeys = false) => {
+	type RetryRequestOptions = {
+		forceIncludeKeys?: boolean
+		retryReason?: RetryReason
+	}
+	type RetryRequestResult = {
+		disposition: 'sent' | 'terminal'
+		retryCount: number
+	}
+
+	const getSessionRepairCandidates = (msgKey: WAMessageKey, fromJid: string, participant?: string) => {
+		const candidates = new Set<string>()
+		const participantCandidates = [msgKey.participant, participant, msgKey.participantAlt].filter(
+			(candidate): candidate is string => !!candidate
+		)
+
+		if (participantCandidates.length) {
+			for (const candidate of participantCandidates) {
+				candidates.add(candidate)
+			}
+		} else {
+			for (const candidate of [msgKey.remoteJid, msgKey.remoteJidAlt, fromJid]) {
+				if (candidate) {
+					candidates.add(candidate)
+				}
+			}
+		}
+
+		return Array.from(candidates)
+	}
+
+	const sendRetryRequest = async (
+		node: BinaryNode,
+		optionsOrForceIncludeKeys: RetryRequestOptions | boolean = {}
+	): Promise<RetryRequestResult> => {
+		let forceIncludeKeys = false
+		let retryReason = RetryReason.UnknownError
+		if (typeof optionsOrForceIncludeKeys === 'boolean') {
+			forceIncludeKeys = optionsOrForceIncludeKeys
+		} else {
+			forceIncludeKeys = optionsOrForceIncludeKeys.forceIncludeKeys || false
+			retryReason = optionsOrForceIncludeKeys.retryReason || RetryReason.UnknownError
+		}
+
 		const { fullMessage } = decodeMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '')
 		const { key: msgKey } = fullMessage
 		const msgId = msgKey.id!
 
 		if (messageRetryManager) {
+			if (messageRetryManager.isRetryBlocked(msgId)) {
+				logger.info({ msgId }, 'retry request blocked because message reached terminal recovery state')
+				return { disposition: 'terminal', retryCount: messageRetryManager.getRetryCount(msgId) }
+			}
+
 			// Check if we've exceeded max retries using the new system
 			if (messageRetryManager.hasExceededMaxRetries(msgId)) {
 				logger.debug({ msgId }, 'reached retry limit with new retry manager, clearing')
-				messageRetryManager.markRetryFailed(msgId)
-				return
+				const retryCount = messageRetryManager.getRetryCount(msgId)
+				messageRetryManager.markRetryFailed(msgId, true)
+				return { disposition: 'terminal', retryCount }
 			}
 
 			// Increment retry count using new system
@@ -427,7 +674,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			if (retryCount >= maxMsgRetryCount) {
 				logger.debug({ retryCount, msgId }, 'reached retry limit, clearing')
 				await msgRetryCache.del(key)
-				return
+				return { disposition: 'terminal', retryCount }
 			}
 
 			retryCount += 1
@@ -439,6 +686,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		const { account, signedPreKey, signedIdentityKey: identityKey } = authState.creds
 		const fromJid = node.attrs.from!
+		const sessionTargetJid = msgKey.participant || node.attrs.participant || fromJid
+		const sessionRepairCandidates = getSessionRepairCandidates(msgKey, fromJid, node.attrs.participant)
 
 		// Check if we should recreate the session
 		let shouldRecreateSession = false
@@ -446,21 +695,33 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		if (enableAutoSessionRecreation && messageRetryManager && retryCount > 1) {
 			try {
-				// Check if we have a session with this JID
-				const sessionId = signalRepository.jidToSignalProtocolAddress(fromJid)
-				const hasSession = await signalRepository.validateSession(fromJid)
-				const result = messageRetryManager.shouldRecreateSession(fromJid, hasSession.exists)
+				const sessionValidationTarget = sessionRepairCandidates[0] || sessionTargetJid
+				const hasSession = await signalRepository.validateSession(sessionValidationTarget)
+				const result = messageRetryManager.shouldRecreateSession(
+					sessionValidationTarget,
+					hasSession.exists,
+					retryReason
+				)
 				shouldRecreateSession = result.recreate
 				recreateReason = result.reason
 
 				if (shouldRecreateSession) {
-					logger.debug({ fromJid, retryCount, reason: recreateReason }, 'recreating session for retry')
-					// Delete existing session to force recreation
-					await authState.keys.set({ session: { [sessionId]: null } })
+					logger.debug(
+						{
+							fromJid,
+							sessionTargetJid,
+							sessionRepairCandidates,
+							retryCount,
+							reason: recreateReason,
+							retryReason
+						},
+						'recreating session for retry'
+					)
+					await signalRepository.deleteSession(sessionRepairCandidates)
 					forceIncludeKeys = true
 				}
 			} catch (error) {
-				logger.warn({ error, fromJid }, 'failed to check session recreation')
+				logger.warn({ error, fromJid, sessionTargetJid }, 'failed to check session recreation')
 			}
 		}
 
@@ -502,8 +763,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							id: node.attrs.id!,
 							t: node.attrs.t!,
 							v: '1',
-							// ADD ERROR FIELD
-							error: '0'
+							error: retryReason.toString()
 						}
 					},
 					{
@@ -546,8 +806,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 			await sendNode(receipt)
 
-			logger.info({ msgAttrs: node.attrs, retryCount }, 'sent retry receipt')
+			logger.info({ msgAttrs: node.attrs, retryCount, retryReason }, 'sent retry receipt')
 		}, authState?.creds?.me?.id || 'sendRetryRequest')
+
+		return { disposition: 'sent', retryCount }
 	}
 
 	const handleEncryptNotification = async (node: BinaryNode) => {
@@ -577,14 +839,35 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 	}
 
-	const handleGroupNotification = (fullNode: BinaryNode, child: BinaryNode, msg: Partial<WAMessage>) => {
-		// TODO: Support PN/LID (Here is only LID now)
+	const handleGroupNotification = async (fullNode: BinaryNode, child: BinaryNode, msg: Partial<WAMessage>) => {
+		const actingPrimary = fullNode.attrs.participant
+		const actingSecondary = fullNode.attrs.participant_pn
+		const actingParticipantLid = isLidLike(actingPrimary)
+			? actingPrimary
+			: isLidLike(actingSecondary)
+				? actingSecondary
+				: undefined
+		const actingParticipantPn = isPnLike(actingPrimary)
+			? actingPrimary
+			: isPnLike(actingSecondary)
+				? actingSecondary
+				: undefined
 
-		const actingParticipantLid = fullNode.attrs.participant
-		const actingParticipantPn = fullNode.attrs.participant_pn
+		const affectedNode = getBinaryNodeChild(child, 'participant')
+		const affectedPrimary = affectedNode?.attrs?.jid
+		const affectedParticipantPn =
+			(isPnLike(affectedNode?.attrs?.phone_number) && affectedNode?.attrs?.phone_number) ||
+			(isPnLike(affectedPrimary) && affectedPrimary) ||
+			actingParticipantPn
+		const affectedParticipantLid =
+			(isLidLike(affectedNode?.attrs?.lid) && affectedNode?.attrs?.lid) ||
+			(isLidLike(affectedPrimary) && affectedPrimary) ||
+			actingParticipantLid
 
-		const affectedParticipantLid = getBinaryNodeChild(child, 'participant')?.attrs?.jid || actingParticipantLid!
-		const affectedParticipantPn = getBinaryNodeChild(child, 'participant')?.attrs?.phone_number || actingParticipantPn!
+		await storeLidPnMappings([
+			{ lid: actingParticipantLid, pn: actingParticipantPn },
+			{ lid: affectedParticipantLid, pn: affectedParticipantPn }
+		])
 
 		switch (child?.tag) {
 			case 'create':
@@ -592,7 +875,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 				msg.messageStubType = WAMessageStubType.GROUP_CREATE
 				msg.messageStubParameters = [metadata.subject]
-				msg.key = { participant: metadata.owner, participantAlt: metadata.ownerPn }
+				msg.key = {
+					participant: metadata.owner || metadata.ownerPn,
+					participantAlt: metadata.owner && metadata.ownerPn ? metadata.ownerPn : undefined
+				}
 
 				ev.emit('chats.upsert', [
 					{
@@ -604,7 +890,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				ev.emit('groups.upsert', [
 					{
 						...metadata,
-						author: actingParticipantLid,
+						author: actingParticipantLid || actingParticipantPn,
 						authorPn: actingParticipantPn
 					}
 				])
@@ -619,7 +905,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				}
 				break
 			case 'modify':
-				const oldNumber = getBinaryNodeChildren(child, 'participant').map(p => p.attrs.jid!)
+				const oldNumber = getBinaryNodeChildren(child, 'participant')
+					.map(p => p.attrs.jid!)
+					.filter(Boolean)
 				msg.messageStubParameters = oldNumber || []
 				msg.messageStubType = WAMessageStubType.GROUP_PARTICIPANT_CHANGE_NUMBER
 				break
@@ -631,15 +919,35 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				const stubType = `GROUP_PARTICIPANT_${child.tag.toUpperCase()}`
 				msg.messageStubType = WAMessageStubType[stubType as keyof typeof WAMessageStubType]
 
-				const participants = getBinaryNodeChildren(child, 'participant').map(({ attrs }) => {
-					// TODO: Store LID MAPPINGS
-					return {
-						id: attrs.jid!,
-						phoneNumber: isLidUser(attrs.jid) && isPnUser(attrs.phone_number) ? attrs.phone_number : undefined,
-						lid: isPnUser(attrs.jid) && isLidUser(attrs.lid) ? attrs.lid : undefined,
-						admin: (attrs.type || null) as GroupParticipant['admin']
-					}
-				})
+				const participants = getBinaryNodeChildren(child, 'participant').reduce<GroupParticipant[]>(
+					(acc, { attrs }) => {
+						const id = attrs.jid || attrs.phone_number || attrs.lid
+						if (!id) {
+							return acc
+						}
+
+						const phoneNumber =
+							(isLidLike(attrs.jid) && isPnLike(attrs.phone_number) && attrs.phone_number) ||
+							(isPnLike(attrs.jid) && attrs.jid) ||
+							undefined
+						const lid =
+							(isPnLike(attrs.jid) && isLidLike(attrs.lid) && attrs.lid) ||
+							(isLidLike(attrs.jid) && attrs.jid) ||
+							undefined
+						acc.push({
+							id,
+							phoneNumber,
+							lid,
+							admin: (attrs.type || null) as GroupParticipant['admin']
+						})
+						return acc
+					},
+					[]
+				)
+
+				await storeLidPnMappings(
+					participants.map(participant => ({ lid: participant.lid, pn: participant.phoneNumber }))
+				)
 
 				if (
 					participants.length === 1 &&
@@ -652,7 +960,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					msg.messageStubType = WAMessageStubType.GROUP_PARTICIPANT_LEAVE
 				}
 
-				msg.messageStubParameters = participants.map(a => JSON.stringify(a))
+				msg.messageStubParameters = encodeGroupParticipantStubs(participants)
 				break
 			case 'subject':
 				msg.messageStubType = WAMessageStubType.GROUP_CHANGE_SUBJECT
@@ -703,7 +1011,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				break
 			case 'revoked_membership_requests':
 				const isDenied = areJidsSameUser(affectedParticipantLid, actingParticipantLid)
-				// TODO: LIDMAPPING SUPPORT
 				msg.messageStubType = WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_REQUEST_NON_ADMIN_ADD
 				msg.messageStubParameters = [
 					JSON.stringify({ lid: affectedParticipantLid, pn: affectedParticipantPn }),
@@ -727,8 +1034,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				await handleMexNewsletterNotification(node)
 				break
 			case 'w:gp2':
-				// TODO: HANDLE PARTICIPANT_PN
-				handleGroupNotification(node, child!, result)
+				result.participant = node.attrs.participant || node.attrs.participant_pn
+				await handleGroupNotification(node, child!, result)
 				break
 			case 'mediaretry':
 				const event = decodeMediaRetryNode(node)
@@ -739,15 +1046,27 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				break
 			case 'devices':
 				const devices = getBinaryNodeChildren(child, 'device')
+				const deviceData = devices.map(d => ({
+					id: d.attrs.jid,
+					lid: d.attrs.lid,
+					keyIndex: d.attrs['key-index'] ? +d.attrs['key-index'] : undefined,
+					isHosted: d.attrs['is_hosted'] === 'true'
+				}))
 				if (
 					areJidsSameUser(child!.attrs.jid, authState.creds.me!.id) ||
 					areJidsSameUser(child!.attrs.lid, authState.creds.me!.lid)
 				) {
-					const deviceData = devices.map(d => ({ id: d.attrs.jid, lid: d.attrs.lid }))
 					logger.info({ deviceData }, 'my own devices changed')
 				}
 
-				//TODO: drop a new event, add hashes
+				ev.emit('devices.update', {
+					jid: child!.attrs.jid,
+					lid: child!.attrs.lid,
+					hash: child!.attrs.hash,
+					phash: child!.attrs.phash,
+					ts: child!.attrs.ts ? +child!.attrs.ts : undefined,
+					devices: deviceData
+				})
 
 				break
 			case 'server_sync':
@@ -761,14 +1080,23 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			case 'picture':
 				const setPicture = getBinaryNodeChild(node, 'set')
 				const delPicture = getBinaryNodeChild(node, 'delete')
-
-				// TODO: WAJIDHASH stuff proper support inhouse
-				ev.emit('contacts.update', [
-					{
-						id: jidNormalizedUser(node?.attrs?.from) || (setPicture || delPicture)?.attrs?.hash || '',
-						imgUrl: setPicture ? 'changed' : 'removed'
-					}
-				])
+				const pictureOwner = jidNormalizedUser(node?.attrs?.from || setPicture?.attrs?.jid || delPicture?.attrs?.jid)
+				if (pictureOwner) {
+					ev.emit('contacts.update', [
+						{
+							id: pictureOwner,
+							imgUrl: setPicture ? 'changed' : 'removed'
+						}
+					])
+				} else {
+					logger.debug(
+						{
+							from: node?.attrs?.from,
+							hash: (setPicture || delPicture)?.attrs?.hash
+						},
+						'skipping picture update without resolvable jid'
+					)
+				}
 
 				if (isJidGroup(from)) {
 					const node = setPicture || delPicture
@@ -1040,7 +1368,13 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					}
 				}
 
-				await relayMessage(key.remoteJid!, msg, msgRelayOpts)
+				const relayJid = key.remoteJid || key.participant
+				if (!relayJid) {
+					logger.warn({ key, id: ids[i] }, 'skipping retry relay because target jid is missing')
+					continue
+				}
+
+				await relayMessage(relayJid, msg, msgRelayOpts)
 			} else {
 				logger.debug({ jid: key.remoteJid, id: ids[i] }, 'recv retry request, but message not available')
 			}
@@ -1054,7 +1388,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			attrs.participant || attrs.from,
 			isLid ? authState.creds.me?.lid : authState.creds.me?.id
 		)
-		const remoteJid = !isNodeFromMe || isJidGroup(attrs.from) ? attrs.from : attrs.recipient
+		const remoteJid = !isNodeFromMe || isJidGroup(attrs.from) ? attrs.from : attrs.recipient || attrs.from
 		const fromMe = !attrs.recipient || ((attrs.type === 'retry' || attrs.type === 'sender') && isNodeFromMe)
 
 		const key: proto.IMessageKey = {
@@ -1110,6 +1444,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								}))
 							)
 						}
+
+						if (key.remoteJid) {
+							await Promise.all(ids.map(id => clearAckRecoveryState(key.remoteJid!, id)))
+						}
 					}
 
 					if (attrs.type === 'retry') {
@@ -1155,18 +1493,21 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				notificationMutex.mutex(async () => {
 					const msg = await processNotification(node)
 					if (msg) {
-						const fromMe = areJidsSameUser(node.attrs.participant || remoteJid, authState.creds.me!.id)
+						const participant = node.attrs.participant || node.attrs.participant_pn
+						const fromMe =
+							areJidsSameUser(participant || remoteJid, authState.creds.me!.id) ||
+							areJidsSameUser(participant || remoteJid, authState.creds.me!.lid)
 						const { senderAlt: participantAlt, addressingMode } = extractAddressingContext(node)
 						msg.key = {
 							remoteJid,
 							fromMe,
-							participant: node.attrs.participant,
+							participant,
 							participantAlt,
 							addressingMode,
 							id: node.attrs.id,
 							...(msg.key || {})
 						}
-						msg.participant ??= node.attrs.participant
+						msg.participant ??= participant
 						msg.messageTimestamp = +node.attrs.t!
 
 						const fullMsg = proto.WebMessageInfo.fromObject(msg) as WAMessage
@@ -1187,7 +1528,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		}
 
 		const encNode = getBinaryNodeChild(node, 'enc')
-		// TODO: temporary fix for crashes and issues resulting of failed msmsg decryption
+		// msmsg payloads require message secrets that are not always present in desktop envelopes.
+		// when absent, acknowledge with MissingMessageSecret to avoid retry loops/crashes.
 		if (encNode?.attrs.type === 'msmsg') {
 			logger.debug({ key: node.attrs.key }, 'ignored msmsg')
 			await sendMessageAck(node, NACK_REASONS.MissingMessageSecret)
@@ -1311,11 +1653,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 						const errorMessage = msg?.messageStubParameters?.[0] || ''
 						const isPreKeyError = errorMessage.includes('PreKey')
+						const isMissingSenderKeySession = errorMessage.includes('No session found to decrypt message')
+						const retryReason = getRetryReasonFromDecryptError(errorMessage)
+						const decryptRuntimeState = getDecryptRuntimeState(msg)
+						let retryResult: RetryRequestResult | undefined
 
 						logger.debug(`[handleMessage] Attempting retry request for failed decryption`)
 
 						// Handle both pre-key and normal retries in single mutex
 						await retryMutex.mutex(async () => {
+							let ackErrorCode: number | undefined
 							try {
 								if (!ws.isOpen) {
 									logger.debug({ node }, 'Connection closed, skipping retry')
@@ -1326,34 +1673,57 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								if (isPreKeyError) {
 									logger.info({ error: errorMessage }, 'PreKey error detected, uploading and retrying')
 
-									try {
+									const now = Date.now()
+									const timeSinceLastUpload = now - lastPreKeyUploadAt
+									if (timeSinceLastUpload >= PREKEY_UPLOAD_COOLDOWN_MS) {
 										logger.debug('Uploading pre-keys for error recovery')
 										await uploadPreKeys(5)
+										lastPreKeyUploadAt = Date.now()
 										logger.debug('Waiting for server to process new pre-keys')
 										await delay(1000)
-									} catch (uploadErr) {
-										logger.error({ uploadErr }, 'Pre-key upload failed, proceeding with retry anyway')
+									} else {
+										logger.debug(
+											{
+												timeSinceLastUpload,
+												cooldownMs: PREKEY_UPLOAD_COOLDOWN_MS
+											},
+											'skipping pre-key upload because a recent recovery upload already happened'
+										)
 									}
 								}
 
+								if (isMissingSenderKeySession && msg.key.id) {
+									const requestId = await requestPlaceholderResend(msg.key)
+									logger.debug(
+										{ msgId: msg.key.id, requestId },
+										'requested placeholder resend for missing sender-key recovery'
+									)
+								}
+
 								const encNode = getBinaryNodeChild(node, 'enc')
-								await sendRetryRequest(node, !encNode)
-								if (retryRequestDelayMs) {
+								retryResult = await sendRetryRequest(node, {
+									forceIncludeKeys: !encNode || isPreKeyError || isMissingSenderKeySession,
+									retryReason
+								})
+								if (retryResult.disposition === 'sent' && retryRequestDelayMs) {
 									await delay(retryRequestDelayMs)
 								}
 							} catch (err) {
-								logger.error({ err, isPreKeyError }, 'Failed to handle retry, attempting basic retry')
-								// Still attempt retry even if pre-key upload failed
-								try {
-									const encNode = getBinaryNodeChild(node, 'enc')
-									await sendRetryRequest(node, !encNode)
-								} catch (retryErr) {
-									logger.error({ retryErr }, 'Failed to send retry after error handling')
-								}
+								ackErrorCode = NACK_REASONS.UnhandledError
+								logger.error({ err, isPreKeyError, retryReason }, 'Failed to handle retry in strict mode')
+								throw err
+							} finally {
+								await sendMessageAck(node, ackErrorCode)
 							}
-
-							await sendMessageAck(node, NACK_REASONS.UnhandledError)
 						})
+
+						if (decryptRuntimeState?.suppressCiphertextUpsert && retryResult?.disposition === 'sent') {
+							logger.debug(
+								{ key: msg.key },
+								'suppressing transient ciphertext upsert while sender-key recovery is pending'
+							)
+							return
+						}
 					}
 				} else {
 					if (messageRetryManager && msg.key.id) {
@@ -1373,7 +1743,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							type = 'sender'
 							// need to specially handle this case
 							if (isLidUser(msg.key.remoteJid!) || isLidUser(msg.key.remoteJidAlt)) {
-								participant = author // TODO: investigate sending receipts to LIDs and not PNs
+								participant = author || msg.key.participantAlt || msg.key.participant
 							}
 						} else if (!sendActiveReceipts) {
 							type = 'inactive'
@@ -1384,8 +1754,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						// send ack for history message
 						const isAnyHistoryMsg = getHistoryMsg(msg.message!)
 						if (isAnyHistoryMsg) {
-							const jid = jidNormalizedUser(msg.key.remoteJid!)
-							await sendReceipt(jid, undefined, [msg.key.id!], 'hist_sync') // TODO: investigate
+							const jid =
+								isLidLike(msg.key.remoteJid) && isPnLike(msg.key.remoteJidAlt)
+									? jidNormalizedUser(msg.key.remoteJidAlt || undefined)
+									: jidNormalizedUser(msg.key.remoteJid!)
+							await sendReceipt(jid, undefined, [msg.key.id!], 'hist_sync')
 						}
 					} else {
 						await sendMessageAck(node)
@@ -1398,6 +1771,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				await upsertMessage(msg, node.attrs.offline ? 'append' : 'notify')
 			})
 		} catch (error) {
+			const statusCode = (error as Boom | undefined)?.output?.statusCode
+			if (statusCode === DisconnectReason.connectionClosed || statusCode === DisconnectReason.connectionLost) {
+				logger.debug({ error, node: binaryNodeToString(node) }, 'skipping message processing after connection close')
+				return
+			}
+
 			logger.error({ error, node: binaryNodeToString(node) }, 'error in handling message')
 		}
 	}
@@ -1470,16 +1849,32 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// error in acknowledgement,
 		// device could not display the message
 		if (attrs.error) {
-			logger.warn({ attrs }, 'received error in ack')
-			ev.emit('messages.update', [
-				{
-					key,
-					update: {
-						status: WAMessageStatus.ERROR,
-						messageStubParameters: [attrs.error]
+			const errorCode = `${attrs.error}`
+			const isRetryableAckError = ACK_RECOVERY_RETRYABLE_ERRORS.has(errorCode)
+			if (isRetryableAckError) {
+				logger.info({ attrs }, 'received retryable error in ack')
+				ev.emit('messages.update', [
+					{
+						key,
+						update: {
+							messageStubParameters: [attrs.error]
+						}
 					}
-				}
-			])
+				])
+			} else {
+				logger.warn({ attrs }, 'received error in ack')
+				ev.emit('messages.update', [
+					{
+						key,
+						update: {
+							status: WAMessageStatus.ERROR,
+							messageStubParameters: [attrs.error]
+						}
+					}
+				])
+			}
+
+			await attemptAckErrorRecovery(attrs, key)
 
 			// resend the message with device_fanout=false, use at your own risk
 			// if (attrs.error === '475') {

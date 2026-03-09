@@ -1,0 +1,47 @@
+{
+  "manifestVersion": 1,
+  "generated": {
+    "waProto": {
+      "sourceProto": {
+        "path": "WAProto/WAProto.proto",
+        "sha256": "4BAB5324186DAF8DE5AB592548EE80DFC753651667FA9411E0666837F90E4C8D"
+      },
+      "generatedFiles": {
+        "proto": {
+          "path": "native/generated/WAProto_cpp.proto",
+          "sha256": "60E0F6159D3A6FB87F81980B250E276C2D6DAA51D686CFAB99BF10961904BC2C"
+        },
+        "header": {
+          "path": "native/generated/WAProto_cpp.pb.h",
+          "sha256": "7410B4582B0619661C1C25C194CFE5B7BE9DF17FB6AC80BBBADD7D99CE6B3175"
+        },
+        "source": {
+          "path": "native/generated/WAProto_cpp.pb.cc",
+          "sha256": "C8E90E28CFB4CC61B4C121FAB54D4DFC434EE280F98F5A31EB12FB6B05ADFAA7"
+        }
+      },
+      "generator": {
+        "script": "scripts/generate-waproto-cpp.mjs",
+        "protocVersion": "libprotoc 33.4",
+        "sourceHash": "9f30389b5e17d5f0cafc090a8e7852874defef359ef01ff187e9c6be6a5c4dd1"
+      }
+    }
+  },
+  "thirdParty": {
+    "miniz": {
+      "declaredVersion": "3.1.0",
+      "files": {
+        "miniz.c": "F23204EFEE2BFAFFB72A974D2E28C64C3C1D9787144B5C5890F129C465E467BD",
+        "miniz.h": "672280C799FFF9D703F0ECD586DE2A53349D0F4E50B13928F78529C1DDF3D75C",
+        "miniz_common.h": "F1BA29821C8CAEF83585B328196AA346C5DA7C82890A70A3D10D77C6CEC0ED39",
+        "miniz_export.h": "E90E12BB9B6ED37AA4725B9DA70E2499DC48CA5CDCC0840C2F25BF8C1A5D04D5",
+        "miniz_tdef.c": "30AA8BF68EBCD6D15F03E1DB3C7E72D70A038D4A44E74E69193185EA9187ECD0",
+        "miniz_tdef.h": "D62DA02953C3834DFCBDE4DB026C6D9345013EF9B0E53185131016A3A4E48C33",
+        "miniz_tinfl.c": "2296EBD21EF9AF5EBBEFD5B454D4BB67D8FB4AF2D24945E7FB32114374F75A76",
+        "miniz_tinfl.h": "DA4850920FDF09F8877D9AFFABE1EBBA1852CE4B1EBBD121F2BA7A7EA8E57E5D",
+        "miniz_zip.c": "3C1F90797C02DDC9D6BFCDF7079F5EA6F6212F257ED8745F2334DD021D697669",
+        "miniz_zip.h": "B062A5DEF545445C73FD1D664E35A89165DFB0D996AB848F507244E819CFCF04"
+      }
+    }
+  }
+}

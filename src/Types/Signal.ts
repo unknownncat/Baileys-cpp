@@ -4,23 +4,45 @@ import type { LIDMappingStore } from '../Signal/lid-mapping'
 type DecryptGroupSignalOpts = {
 	group: string
 	authorJid: string
+	authorAltJid?: string
 	msg: Uint8Array
 }
 
 type ProcessSenderKeyDistributionMessageOpts = {
 	item: proto.Message.ISenderKeyDistributionMessage
 	authorJid: string
+	authorAltJid?: string
 }
 
 type DecryptSignalProtoOpts = {
 	jid: string
+	jidAlt?: string
 	type: 'pkmsg' | 'msg'
 	ciphertext: Uint8Array
+}
+
+type DecryptMessageBatchResult = {
+	jid: string
+	type: 'pkmsg' | 'msg'
+	plaintext: Uint8Array
+	error?: string
 }
 
 type EncryptMessageOpts = {
 	jid: string
 	data: Uint8Array
+}
+
+type EncryptMessageBatchItem = {
+	jid: string
+	data: Uint8Array
+}
+
+type EncryptMessageBatchResult = {
+	jid: string
+	type: 'pkmsg' | 'msg'
+	ciphertext: Uint8Array
+	error?: string
 }
 
 type EncryptGroupMessageOpts = {
@@ -54,19 +76,21 @@ export type SignalRepository = {
 	decryptGroupMessage(opts: DecryptGroupSignalOpts): Promise<Uint8Array>
 	processSenderKeyDistributionMessage(opts: ProcessSenderKeyDistributionMessageOpts): Promise<void>
 	decryptMessage(opts: DecryptSignalProtoOpts): Promise<Uint8Array>
+	decryptMessagesBatch?(items: DecryptSignalProtoOpts[]): Promise<DecryptMessageBatchResult[]>
 	encryptMessage(opts: EncryptMessageOpts): Promise<{
 		type: 'pkmsg' | 'msg'
 		ciphertext: Uint8Array
 	}>
+	encryptMessagesBatch?(items: EncryptMessageBatchItem[]): Promise<EncryptMessageBatchResult[]>
 	encryptGroupMessage(opts: EncryptGroupMessageOpts): Promise<{
 		senderKeyDistributionMessage: Uint8Array
 		ciphertext: Uint8Array
 	}>
 	injectE2ESession(opts: E2ESessionOpts): Promise<void>
+	injectE2ESessions?(opts: E2ESessionOpts[]): Promise<void>
 	validateSession(jid: string): Promise<{ exists: boolean; reason?: string }>
 	jidToSignalProtocolAddress(jid: string): string
 	migrateSession(fromJid: string, toJid: string): Promise<{ migrated: number; skipped: number; total: number }>
-	validateSession(jid: string): Promise<{ exists: boolean; reason?: string }>
 	deleteSession(jids: string[]): Promise<void>
 }
 

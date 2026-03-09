@@ -14,6 +14,7 @@ import {
 	TimeMs,
 	UPLOAD_TIMEOUT
 } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { LIDMapping, SocketConfig } from '../Types'
 import { DisconnectReason } from '../Types'
 import {
@@ -123,6 +124,212 @@ export const makeSocket = (config: SocketConfig) => {
 
 	ws.connect()
 
+	const nativeEmitSocketCallbackEvents = requireNativeExport('emitSocketCallbackEvents')
+	const NativeMessageWaiterRegistryCtor = requireNativeExport('NativeMessageWaiterRegistry')
+	const nativeWaiterRegistry = new NativeMessageWaiterRegistryCtor()
+
+	type PendingMessageWaiter<T> = {
+		resolve: (data: T | undefined) => void
+		reject: (err: Error) => void
+		msgId: string
+		token?: number
+		timeout?: NodeJS.Timeout
+		settled: boolean
+	}
+
+	const pendingMessageWaitersByToken = new Map<number, PendingMessageWaiter<unknown>>()
+	let nextPendingWaiterToken = 1
+	let nativeWaiterSweepInterval: NodeJS.Timeout | undefined
+
+	const stopNativeWaiterSweep = () => {
+		if (nativeWaiterSweepInterval) {
+			clearInterval(nativeWaiterSweepInterval)
+			nativeWaiterSweepInterval = undefined
+		}
+	}
+
+	const settlePendingMessageWaiter = (
+		msgId: string,
+		waiter: PendingMessageWaiter<unknown>,
+		type: 'resolve' | 'reject',
+		value: unknown,
+		alreadyRemoved = false
+	) => {
+		if (waiter.settled) {
+			return
+		}
+
+		waiter.settled = true
+		const token = waiter.token
+		if (typeof token === 'number') {
+			if (!alreadyRemoved) {
+				nativeWaiterRegistry.removeWaiter(token)
+			}
+
+			pendingMessageWaitersByToken.delete(token)
+		}
+
+		if (type === 'resolve') {
+			waiter.resolve(value)
+		} else {
+			waiter.reject(value as Error)
+		}
+	}
+
+	const sweepExpiredNativeWaiters = () => {
+		if (pendingMessageWaitersByToken.size === 0) {
+			stopNativeWaiterSweep()
+			return
+		}
+
+		const expiredTokens = nativeWaiterRegistry.evictExpired(Date.now())
+
+		if (expiredTokens.length === 0 && pendingMessageWaitersByToken.size === 0) {
+			stopNativeWaiterSweep()
+			return
+		}
+
+		for (const token of expiredTokens) {
+			const waiter = pendingMessageWaitersByToken.get(token)
+			if (!waiter) {
+				continue
+			}
+
+			logger?.warn?.({ msgId: waiter.msgId }, 'timed out waiting for message')
+			settlePendingMessageWaiter(waiter.msgId, waiter, 'resolve', undefined, true)
+		}
+
+		if (pendingMessageWaitersByToken.size === 0) {
+			stopNativeWaiterSweep()
+		}
+	}
+
+	const ensureNativeWaiterSweep = () => {
+		if (nativeWaiterSweepInterval) {
+			return
+		}
+
+		nativeWaiterSweepInterval = setInterval(sweepExpiredNativeWaiters, 200)
+	}
+
+	const resolvePendingMessageWaiters = (msgId: string | undefined, data: unknown) => {
+		if (!msgId) {
+			return false
+		}
+
+		const tokens = nativeWaiterRegistry.resolveMessage(msgId)
+		if (!tokens.length) {
+			return false
+		}
+
+		for (const token of tokens) {
+			const waiter = pendingMessageWaitersByToken.get(token)
+			if (!waiter) {
+				continue
+			}
+
+			settlePendingMessageWaiter(waiter.msgId, waiter, 'resolve', data, true)
+		}
+
+		if (pendingMessageWaitersByToken.size === 0) {
+			stopNativeWaiterSweep()
+		}
+
+		return true
+	}
+
+	const rejectAllPendingMessageWaiters = (err?: Error) => {
+		if (!pendingMessageWaitersByToken.size) {
+			return
+		}
+
+		const reason =
+			err ||
+			new Boom('Connection Closed', {
+				statusCode: DisconnectReason.connectionClosed
+			})
+
+		const tokens = nativeWaiterRegistry.rejectAll()
+		if (tokens.length) {
+			for (const token of tokens) {
+				const waiter = pendingMessageWaitersByToken.get(token)
+				if (!waiter) {
+					continue
+				}
+
+				settlePendingMessageWaiter(waiter.msgId, waiter, 'reject', reason, true)
+			}
+		} else {
+			for (const waiter of Array.from(pendingMessageWaitersByToken.values())) {
+				settlePendingMessageWaiter(waiter.msgId, waiter, 'reject', reason, true)
+			}
+		}
+
+		pendingMessageWaitersByToken.clear()
+		stopNativeWaiterSweep()
+	}
+
+	// Waiters live in a token registry so replies/timeouts can be resolved without attaching listeners per query.
+	const createMessageWaiter = <T>(msgId: string, timeoutMs = defaultQueryTimeoutMs ?? 0) => {
+		let waiterRef: PendingMessageWaiter<T> | undefined
+		const promise = new Promise<T | undefined>((resolve, reject) => {
+			const waiter: PendingMessageWaiter<T> = {
+				resolve,
+				reject,
+				msgId,
+				settled: false
+			}
+
+			const allocateToken = () => {
+				let token = nextPendingWaiterToken
+				for (let attempts = 0; attempts < 0xffffffff; attempts += 1) {
+					nextPendingWaiterToken = nextPendingWaiterToken >= 0xfffffffe ? 1 : nextPendingWaiterToken + 1
+					if (!pendingMessageWaitersByToken.has(token)) {
+						return token
+					}
+
+					token = nextPendingWaiterToken
+				}
+
+				return undefined
+			}
+
+			const token = allocateToken()
+			if (typeof token !== 'number') {
+				throw new Boom('failed to allocate native waiter token', { statusCode: DisconnectReason.connectionClosed })
+			}
+
+			const deadlineMs = timeoutMs > 0 ? Date.now() + timeoutMs : 0
+			waiter.token = token
+			pendingMessageWaitersByToken.set(token, waiter as unknown as PendingMessageWaiter<unknown>)
+			nativeWaiterRegistry.registerWaiter(msgId, token, deadlineMs)
+			if (deadlineMs > 0) {
+				ensureNativeWaiterSweep()
+			}
+
+			waiterRef = waiter
+		})
+
+		return {
+			promise,
+			cancel: (err?: Error) => {
+				if (!waiterRef) {
+					return
+				}
+
+				settlePendingMessageWaiter(
+					msgId,
+					waiterRef as unknown as PendingMessageWaiter<unknown>,
+					'reject',
+					err ||
+						new Boom('Query Cancelled', {
+							statusCode: DisconnectReason.connectionClosed
+						})
+				)
+			}
+		}
+	}
+
 	const sendPromise = promisify(ws.send)
 	/** send a raw buffer */
 	const sendRawMessage = async (data: Uint8Array | Buffer) => {
@@ -157,45 +364,7 @@ export const makeSocket = (config: SocketConfig) => {
 	 * @param timeoutMs timeout after which the promise will reject
 	 */
 	const waitForMessage = async <T>(msgId: string, timeoutMs = defaultQueryTimeoutMs) => {
-		let onRecv: ((data: T) => void) | undefined
-		let onErr: ((err: Error) => void) | undefined
-		try {
-			const result = await promiseTimeout<T>(timeoutMs, (resolve, reject) => {
-				onRecv = data => {
-					resolve(data)
-				}
-
-				onErr = err => {
-					reject(
-						err ||
-							new Boom('Connection Closed', {
-								statusCode: DisconnectReason.connectionClosed
-							})
-					)
-				}
-
-				ws.on(`TAG:${msgId}`, onRecv)
-				ws.on('close', onErr)
-				ws.on('error', onErr)
-
-				return () => reject(new Boom('Query Cancelled'))
-			})
-			return result
-		} catch (error) {
-			// Catch timeout and return undefined instead of throwing
-			if (error instanceof Boom && error.output?.statusCode === DisconnectReason.timedOut) {
-				logger?.warn?.({ msgId }, 'timed out waiting for message')
-				return undefined
-			}
-
-			throw error
-		} finally {
-			if (onRecv) ws.off(`TAG:${msgId}`, onRecv)
-			if (onErr) {
-				ws.off('close', onErr)
-				ws.off('error', onErr)
-			}
-		}
+		return createMessageWaiter<T>(msgId, timeoutMs).promise
 	}
 
 	/** send a query, and wait for its response. auto-generates message ID if not provided */
@@ -206,12 +375,16 @@ export const makeSocket = (config: SocketConfig) => {
 
 		const msgId = node.attrs.id
 
-		const result = await promiseTimeout<any>(timeoutMs, async (resolve, reject) => {
-			const result = waitForMessage(msgId, timeoutMs).catch(reject)
-			sendNode(node)
-				.then(async () => resolve(await result))
-				.catch(reject)
-		})
+		const waiter = createMessageWaiter<any>(msgId, timeoutMs ?? defaultQueryTimeoutMs)
+		try {
+			await sendNode(node)
+		} catch (error) {
+			waiter.cancel(error as Error)
+			void waiter.promise.catch(() => undefined)
+			throw error
+		}
+
+		const result = await waiter.promise
 
 		if (result && 'tag' in result) {
 			assertNodeErrorFree(result)
@@ -258,9 +431,20 @@ export const makeSocket = (config: SocketConfig) => {
 			throw new Boom('USyncQuery must have at least one protocol')
 		}
 
-		// todo: validate users, throw WARNING on no valid users
-		// variable below has only validated users
-		const validUsers = usyncQuery.users
+		const validUsers = usyncQuery.users.filter(user => !!user.id || !!user.phone)
+		if (!validUsers.length) {
+			throw new Boom('USyncQuery must contain at least one user with id or phone')
+		}
+
+		if (validUsers.length !== usyncQuery.users.length) {
+			logger?.warn(
+				{
+					totalUsers: usyncQuery.users.length,
+					validUsers: validUsers.length
+				},
+				'dropping invalid usync users (missing id and phone)'
+			)
+		}
 
 		const userNodes = validUsers.map(user => {
 			return {
@@ -377,6 +561,8 @@ export const makeSocket = (config: SocketConfig) => {
 	let keepAliveReq: NodeJS.Timeout
 	let qrTimer: NodeJS.Timeout
 	let closed = false
+	// restart-required stream errors are typically followed by xmlstreamend; suppress the duplicate teardown signal.
+	let suppressNextXmlStreamEnd = false
 
 	/** log & process any unexpected errors */
 	const onUnexpectedError = (err: Error | Boom, msg: string) => {
@@ -597,20 +783,10 @@ export const makeSocket = (config: SocketConfig) => {
 				}
 
 				/* Check if this is a response to a message we sent */
-				anyTriggered = ws.emit(`${DEF_TAG_PREFIX}${msgId}`, frame) || anyTriggered
-				/* Check if this is a response to a message we are expecting */
-				const l0 = frame.tag
-				const l1 = frame.attrs || {}
-				const l2 = Array.isArray(frame.content) ? frame.content[0]?.tag : ''
-
-				for (const key of Object.keys(l1)) {
-					anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},${key}:${l1[key]},${l2}`, frame) || anyTriggered
-					anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},${key}:${l1[key]}`, frame) || anyTriggered
-					anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},${key}`, frame) || anyTriggered
-				}
-
-				anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0},,${l2}`, frame) || anyTriggered
-				anyTriggered = ws.emit(`${DEF_CALLBACK_PREFIX}${l0}`, frame) || anyTriggered
+				anyTriggered = resolvePendingMessageWaiters(msgId, frame) || anyTriggered
+				anyTriggered =
+					nativeEmitSocketCallbackEvents(ws as unknown, frame as unknown, DEF_CALLBACK_PREFIX, DEF_TAG_PREFIX) ||
+					anyTriggered
 
 				if (!anyTriggered && logger.level === 'debug') {
 					logger.debug({ unhandled: true, msgId, fromMe: false, frame }, 'communication recv')
@@ -629,7 +805,9 @@ export const makeSocket = (config: SocketConfig) => {
 		logger.info({ trace: error?.stack }, error ? 'connection errored' : 'connection closed')
 
 		clearInterval(keepAliveReq)
+		stopNativeWaiterSweep()
 		clearTimeout(qrTimer)
+		rejectAllPendingMessageWaiters(error)
 
 		ws.removeAllListeners('close')
 		ws.removeAllListeners('open')
@@ -683,9 +861,9 @@ export const makeSocket = (config: SocketConfig) => {
 
 			const diff = Date.now() - lastDateRecv.getTime()
 			/*
-				check if it's been a suspicious amount of time since the server responded with our last seen
-				it could be that the network is down
-			*/
+			check if it's been a suspicious amount of time since the server responded with our last seen
+			it could be that the network is down
+		*/
 			if (diff > keepAliveIntervalMs + 5000) {
 				void end(new Boom('Connection was lost', { statusCode: DisconnectReason.connectionLost }))
 			} else if (ws.isOpen) {
@@ -848,10 +1026,15 @@ export const makeSocket = (config: SocketConfig) => {
 	ws.on('error', mapWebSocketError(end))
 	ws.on('close', () => void end(new Boom('Connection Terminated', { statusCode: DisconnectReason.connectionClosed })))
 	// the server terminated the connection
-	ws.on(
-		'CB:xmlstreamend',
-		() => void end(new Boom('Connection Terminated by Server', { statusCode: DisconnectReason.connectionClosed }))
-	)
+	ws.on('CB:xmlstreamend', () => {
+		if (suppressNextXmlStreamEnd) {
+			suppressNextXmlStreamEnd = false
+			logger.debug('ignoring xmlstreamend after restart-required stream error')
+			return
+		}
+
+		void end(new Boom('Connection Terminated by Server', { statusCode: DisconnectReason.connectionClosed }))
+	})
 	// QR gen
 	ws.on('CB:iq,type:set,pair-device', async (stanza: BinaryNode) => {
 		const iq: BinaryNode = {
@@ -970,10 +1153,17 @@ export const makeSocket = (config: SocketConfig) => {
 	})
 
 	ws.on('CB:stream:error', (node: BinaryNode) => {
-		const [reasonNode] = getAllBinaryNodeChildren(node)
-		logger.error({ reasonNode, fullErrorNode: node }, 'stream errored out')
-
 		const { reason, statusCode } = getErrorCodeFromStreamError(node)
+		const [reasonNode] = getAllBinaryNodeChildren(node)
+		const isReplacedConflict = reasonNode?.tag === 'conflict' && reasonNode?.attrs?.type === 'replaced'
+		if (isReplacedConflict) {
+			logger.warn({ reasonNode, fullErrorNode: node }, 'stream conflict/replaced')
+		} else if (statusCode === DisconnectReason.restartRequired) {
+			suppressNextXmlStreamEnd = true
+			logger.info({ reasonNode, fullErrorNode: node, statusCode }, 'stream restart required')
+		} else {
+			logger.error({ reasonNode, fullErrorNode: node }, 'stream errored out')
+		}
 
 		void end(new Boom(`Stream Errored (${reason})`, { statusCode, data: reasonNode || node }))
 	})

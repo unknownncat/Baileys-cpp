@@ -1,0 +1,33 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "native: configure",
+			"type": "shell",
+			"command": "node-gyp configure",
+			"problemMatcher": []
+		},
+		{
+			"label": "native: build (safe)",
+			"type": "shell",
+			"command": "node scripts/generate-waproto-cpp.mjs; node-gyp configure; node-gyp build -j 1",
+			"problemMatcher": "$msCompile",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		},
+		{
+			"label": "native: rebuild",
+			"type": "shell",
+			"command": "node scripts/generate-waproto-cpp.mjs; node-gyp rebuild -j 1",
+			"problemMatcher": "$msCompile"
+		},
+		{
+			"label": "typescript: build",
+			"type": "shell",
+			"command": "npm run build",
+			"problemMatcher": "$tsc"
+		}
+	]
+}

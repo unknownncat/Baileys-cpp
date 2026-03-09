@@ -1,7 +1,18 @@
 import { LRUCache } from 'lru-cache'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { LIDMapping, SignalKeyStoreWithTransaction } from '../Types'
 import type { ILogger } from '../Utils/logger'
-import { isHostedPnUser, isLidUser, isPnUser, jidDecode, jidNormalizedUser, WAJIDDomains } from '../WABinary'
+import {
+	isHostedLidUser,
+	isHostedPnUser,
+	isLidUser,
+	isPnUser,
+	jidDecode,
+	jidNormalizedUser,
+	WAJIDDomains
+} from '../WABinary'
+
+const nativeNormalizeLidPnMappingsFast = requireNativeExport('normalizeLidPnMappingsFast')
 
 export class LIDMappingStore {
 	private readonly mappingCache = new LRUCache<string, string>({
@@ -30,18 +41,18 @@ export class LIDMappingStore {
 	async storeLIDPNMappings(pairs: LIDMapping[]): Promise<void> {
 		if (pairs.length === 0) return
 
+		const validatedPairsRaw = nativeNormalizeLidPnMappingsFast(pairs)
+		if (!Array.isArray(validatedPairsRaw)) {
+			throw new Error('native normalizeLidPnMappingsFast returned invalid payload')
+		}
+
 		const validatedPairs: Array<{ pnUser: string; lidUser: string }> = []
-		for (const { lid, pn } of pairs) {
-			if (!((isLidUser(lid) && isPnUser(pn)) || (isPnUser(lid) && isLidUser(pn)))) {
-				this.logger.warn(`Invalid LID-PN mapping: ${lid}, ${pn}`)
+		for (const pair of validatedPairsRaw) {
+			if (!pair?.pnUser || !pair?.lidUser) {
 				continue
 			}
 
-			const lidDecoded = jidDecode(lid)
-			const pnDecoded = jidDecode(pn)
-			if (!lidDecoded || !pnDecoded) continue
-
-			validatedPairs.push({ pnUser: pnDecoded.user, lidUser: lidDecoded.user })
+			validatedPairs.push({ pnUser: pair.pnUser, lidUser: pair.lidUser })
 		}
 
 		if (validatedPairs.length === 0) return
@@ -286,7 +297,7 @@ export class LIDMappingStore {
 		}
 
 		for (const lid of lids) {
-			if (!isLidUser(lid)) continue
+			if (!isLidUser(lid) && !isHostedLidUser(lid)) continue
 
 			const decoded = jidDecode(lid)
 			if (!decoded) continue

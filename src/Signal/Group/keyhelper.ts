@@ -1,7 +1,7 @@
 import * as nodeCrypto from 'crypto'
-import { generateKeyPair } from 'libsignal/src/curve'
+import { generateSignalKeyPairRaw } from '../../Utils/crypto'
 
-type KeyPairType = ReturnType<typeof generateKeyPair>
+type KeyPairType = ReturnType<typeof generateSignalKeyPairRaw>
 
 export function generateSenderKey(): Buffer {
 	return nodeCrypto.randomBytes(32)
@@ -18,7 +18,7 @@ export interface SigningKeyPair {
 
 export function generateSenderSigningKey(key?: KeyPairType): SigningKeyPair {
 	if (!key) {
-		key = generateKeyPair()
+		key = generateSignalKeyPairRaw()
 	}
 
 	return {

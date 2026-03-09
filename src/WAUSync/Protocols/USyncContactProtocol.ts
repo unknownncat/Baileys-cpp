@@ -1,5 +1,5 @@
 import type { USyncQueryProtocol } from '../../Types/USync'
-import { assertNodeErrorFree, type BinaryNode } from '../../WABinary'
+import { assertNodeErrorFree, type BinaryNode, jidDecode } from '../../WABinary'
 import { USyncUser } from '../USyncUser'
 
 export class USyncContactProtocol implements USyncQueryProtocol {
@@ -13,10 +13,23 @@ export class USyncContactProtocol implements USyncQueryProtocol {
 	}
 
 	getUserElement(user: USyncUser): BinaryNode {
-		//TODO: Implement type / username fields (not yet supported)
+		const attrs: Record<string, string> = {}
+		if (user.type) {
+			attrs.type = user.type
+		}
+
+		const username =
+			user.username ||
+			(typeof user.id === 'string' ? jidDecode(user.id)?.user : undefined) ||
+			user.phone?.replace(/[^\d+]/g, '')
+
+		if (username) {
+			attrs.username = username
+		}
+
 		return {
 			tag: 'contact',
-			attrs: {},
+			attrs,
 			content: user.phone
 		}
 	}

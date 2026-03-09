@@ -1,4 +1,5 @@
-import { calculateMAC } from 'libsignal/src/crypto'
+import { crypto } from 'libsignal'
+const { calculateMAC } = crypto
 import { SenderMessageKey } from './sender-message-key'
 
 export class SenderChainKey {

@@ -1,3 +1,4 @@
+import { requireNativeExport } from '../Native/baileys-native'
 import type { GetCatalogOptions, ProductCreate, ProductUpdate, SocketConfig, WAMediaUpload } from '../Types'
 import type { UpdateBussinesProfileProps } from '../Types/Bussines'
 import { getRawMediaUploadData } from '../Utils'
@@ -13,61 +14,18 @@ import { type BinaryNode, jidNormalizedUser, S_WHATSAPP_NET } from '../WABinary'
 import { getBinaryNodeChild } from '../WABinary/generic-utils'
 import { makeMessagesRecvSocket } from './messages-recv'
 
+// These trees are deterministic request payloads, so building them natively removes avoidable JS allocation work.
+const nativeBuildBusinessProfileNodesFast = requireNativeExport('buildBusinessProfileNodesFast')
+const nativeBuildCatalogQueryParamsFast = requireNativeExport('buildCatalogQueryParamsFast')
+
 export const makeBusinessSocket = (config: SocketConfig) => {
 	const sock = makeMessagesRecvSocket(config)
 	const { authState, query, waUploadToServer } = sock
 
 	const updateBussinesProfile = async (args: UpdateBussinesProfileProps) => {
-		const node: BinaryNode[] = []
-		const simpleFields: (keyof UpdateBussinesProfileProps)[] = ['address', 'email', 'description']
-
-		node.push(
-			...simpleFields
-				.filter(key => args[key] !== undefined && args[key] !== null)
-				.map(key => ({
-					tag: key,
-					attrs: {},
-					content: args[key] as string
-				}))
-		)
-
-		if (args.websites !== undefined) {
-			node.push(
-				...args.websites.map(website => ({
-					tag: 'website',
-					attrs: {},
-					content: website
-				}))
-			)
-		}
-
-		if (args.hours !== undefined) {
-			node.push({
-				tag: 'business_hours',
-				attrs: { timezone: args.hours.timezone },
-				content: args.hours.days.map(dayConfig => {
-					const base = {
-						tag: 'business_hours_config',
-						attrs: {
-							day_of_week: dayConfig.day,
-							mode: dayConfig.mode
-						}
-					} as const
-
-					if (dayConfig.mode === 'specific_hours') {
-						return {
-							...base,
-							attrs: {
-								...base.attrs,
-								open_time: dayConfig.openTimeInMinutes,
-								close_time: dayConfig.closeTimeInMinutes
-							}
-						}
-					}
-
-					return base
-				})
-			})
+		const profileNodes = nativeBuildBusinessProfileNodesFast(args)
+		if (!Array.isArray(profileNodes)) {
+			throw new Error('native buildBusinessProfileNodesFast returned invalid payload')
 		}
 
 		const result = await query({
@@ -84,7 +42,7 @@ export const makeBusinessSocket = (config: SocketConfig) => {
 						v: '3',
 						mutation_type: 'delta'
 					},
-					content: node
+					content: profileNodes as BinaryNode[]
 				}
 			]
 		})
@@ -158,30 +116,9 @@ export const makeBusinessSocket = (config: SocketConfig) => {
 		jid = jid || authState.creds.me?.id
 		jid = jidNormalizedUser(jid)
 
-		const queryParamNodes: BinaryNode[] = [
-			{
-				tag: 'limit',
-				attrs: {},
-				content: Buffer.from((limit || 10).toString())
-			},
-			{
-				tag: 'width',
-				attrs: {},
-				content: Buffer.from('100')
-			},
-			{
-				tag: 'height',
-				attrs: {},
-				content: Buffer.from('100')
-			}
-		]
-
-		if (cursor) {
-			queryParamNodes.push({
-				tag: 'after',
-				attrs: {},
-				content: cursor
-			})
+		const queryParamNodesRaw = nativeBuildCatalogQueryParamsFast(limit || 10, cursor)
+		if (!Array.isArray(queryParamNodesRaw)) {
+			throw new Error('native buildCatalogQueryParamsFast returned invalid payload')
 		}
 
 		const result = await query({
@@ -198,7 +135,7 @@ export const makeBusinessSocket = (config: SocketConfig) => {
 						jid,
 						allow_shop_source: 'true'
 					},
-					content: queryParamNodes
+					content: queryParamNodesRaw as BinaryNode[]
 				}
 			]
 		})

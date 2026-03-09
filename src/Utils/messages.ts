@@ -11,6 +11,7 @@ import {
 	URL_REGEX,
 	WA_DEFAULT_EPHEMERAL
 } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	AnyMediaMessageContent,
 	AnyMessageContent,
@@ -29,7 +30,13 @@ import type {
 import { WAMessageStatus, WAProto } from '../Types'
 import { isJidGroup, isJidNewsletter, isJidStatusBroadcast, jidNormalizedUser } from '../WABinary'
 import { sha256 } from './crypto'
-import { generateMessageIDV2, getKeyAuthor, unixTimestampSeconds } from './generics'
+import {
+	decodeWAMessage,
+	encodeNewsletterMessage,
+	generateMessageIDV2,
+	getKeyAuthor,
+	unixTimestampSeconds
+} from './generics'
 import type { ILogger } from './logger'
 import {
 	downloadContentFromMessage,
@@ -38,9 +45,12 @@ import {
 	getAudioDuration,
 	getAudioWaveform,
 	getRawMediaUploadData,
-	type MediaDownloadOptions
+	type MediaDownloadOptions,
+	toBuffer
 } from './messages-media'
 import { shouldIncludeReportingToken } from './reporting-utils'
+
+const nativePickFirstExistingKeyFast = requireNativeExport('pickFirstExistingKeyFast')
 
 type ExtractByKey<T, K extends PropertyKey> = T extends Record<K, any> ? T : never
 type RequireKey<T, K extends keyof T> = T & {
@@ -128,10 +138,12 @@ export const prepareWAMessageMedia = async (
 	const logger = options.logger
 
 	let mediaType: (typeof MEDIA_KEYS)[number] | undefined
-	for (const key of MEDIA_KEYS) {
-		if (key in message) {
-			mediaType = key
-		}
+	const pickedMediaType = nativePickFirstExistingKeyFast(
+		message as unknown as Record<string, unknown>,
+		MEDIA_KEYS as unknown as string[]
+	)
+	if (typeof pickedMediaType === 'string' && MEDIA_KEYS.includes(pickedMediaType as (typeof MEDIA_KEYS)[number])) {
+		mediaType = pickedMediaType as (typeof MEDIA_KEYS)[number]
 	}
 
 	if (!mediaType) {
@@ -164,7 +176,7 @@ export const prepareWAMessageMedia = async (
 		if (mediaBuff) {
 			logger?.debug({ cacheableKey }, 'got media cache hit')
 
-			const obj = proto.Message.decode(mediaBuff)
+			const obj = decodeWAMessage(mediaBuff, false) as proto.Message
 			const key = `${mediaType}Message`
 
 			Object.assign(obj[key as keyof proto.Message]!, { ...uploadData, media: undefined })
@@ -192,7 +204,7 @@ export const prepareWAMessageMedia = async (
 		await fs.unlink(filePath)
 
 		const obj = WAProto.Message.fromObject({
-			// todo: add more support here
+			// media-specific fields are merged via uploadData and WAProto conversion
 			[`${mediaType}Message`]: (MessageTypeProto as any)[mediaType].fromObject({
 				url: mediaUrl,
 				directPath,
@@ -351,7 +363,7 @@ export const generateForwardMessageContent = (message: WAMessage, forceForward?:
 
 	// hacky copy
 	content = normalizeMessageContent(content)
-	content = proto.Message.decode(proto.Message.encode(content!).finish())
+	content = decodeWAMessage(encodeNewsletterMessage(content!), false)
 
 	let key = Object.keys(content)[0] as keyof proto.IMessage
 
@@ -474,15 +486,27 @@ export const generateWAMessageContent = async (
 
 		m.groupInviteMessage.groupJid = message.groupInvite.jid
 		m.groupInviteMessage.groupName = message.groupInvite.subject
-		//TODO: use built-in interface and get disappearing mode info etc.
-		//TODO: cache / use store!?
-		if (options.getProfilePicUrl) {
+		m.groupInviteMessage.groupType = proto.Message.GroupInviteMessage.GroupType.DEFAULT
+
+		const inviteThumbCacheKey = `group-invite-thumb:${message.groupInvite.jid}`
+		if (options.mediaCache) {
+			const cachedThumb = await options.mediaCache.get<Buffer>(inviteThumbCacheKey)
+			if (cachedThumb) {
+				m.groupInviteMessage.jpegThumbnail = Buffer.from(cachedThumb)
+			}
+		}
+
+		if (!m.groupInviteMessage.jpegThumbnail && options.getProfilePicUrl) {
 			const pfpUrl = await options.getProfilePicUrl(message.groupInvite.jid, 'preview')
 			if (pfpUrl) {
 				const resp = await fetch(pfpUrl, { method: 'GET', dispatcher: options?.options?.dispatcher })
 				if (resp.ok) {
 					const buf = Buffer.from(await resp.arrayBuffer())
 					m.groupInviteMessage.jpegThumbnail = buf
+					// eslint-disable-next-line max-depth
+					if (options.mediaCache) {
+						await options.mediaCache.set(inviteThumbCacheKey, buf)
+					}
 				}
 			}
 		}
@@ -666,11 +690,19 @@ export const generateWAMessageFromContent = (
 	const innerMessage = normalizeMessageContent(message)!
 	const key = getContentType(innerMessage)! as Exclude<keyof proto.IMessage, 'conversation'>
 	const timestamp = unixTimestampSeconds(options.timestamp)
-	const { quoted, userJid } = options
+	const { quoted, userJid, userLid } = options
+	const ownParticipant =
+		userLid &&
+		(quoted?.key?.addressingMode === 'lid' ||
+			quoted?.key?.participantAlt ||
+			quoted?.key?.remoteJidAlt ||
+			isJidStatusBroadcast(jid))
+			? userLid
+			: userJid
 
 	if (quoted && !isJidNewsletter(jid)) {
 		const participant = quoted.key.fromMe
-			? userJid // TODO: Add support for LIDs
+			? ownParticipant
 			: quoted.participant || quoted.key.participant || quoted.key.remoteJid
 
 		let quotedMsg = normalizeMessageContent(quoted.message)!
@@ -730,7 +762,7 @@ export const generateWAMessageFromContent = (
 		message: message,
 		messageTimestamp: timestamp,
 		messageStubParameters: [],
-		participant: isJidGroup(jid) || isJidStatusBroadcast(jid) ? userJid : undefined, // TODO: Add support for LIDs
+		participant: isJidGroup(jid) || isJidStatusBroadcast(jid) ? ownParticipant : undefined,
 		status: WAMessageStatus.PENDING
 	}
 	return WAProto.WebMessageInfo.fromObject(messageJSON) as WAMessage
@@ -1068,12 +1100,7 @@ export const downloadMediaMessage = async <Type extends 'buffer' | 'stream'>(
 
 		const stream = await downloadContentFromMessage(download, mediaType, options)
 		if (type === 'buffer') {
-			const bufferArray: Buffer[] = []
-			for await (const chunk of stream) {
-				bufferArray.push(chunk)
-			}
-
-			return Buffer.concat(bufferArray)
+			return toBuffer(stream)
 		}
 
 		return stream

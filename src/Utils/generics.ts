@@ -1,6 +1,7 @@
 import { Boom } from '@hapi/boom'
 import { createHash, randomBytes } from 'crypto'
 import { proto } from '../../WAProto/index.js'
+import { requireNativeExport } from '../Native/baileys-native'
 const baileysVersion = [2, 3000, 1033846690]
 import type {
 	BaileysEventEmitter,
@@ -12,7 +13,30 @@ import type {
 } from '../Types'
 import { DisconnectReason } from '../Types'
 import { type BinaryNode, getAllBinaryNodeChildren, jidDecode } from '../WABinary'
-import { sha256 } from './crypto'
+
+const nativePadMessageWithLength = requireNativeExport('padMessageWithLength')
+const nativeGetUnpaddedLengthMax16 = requireNativeExport('getUnpaddedLengthMax16')
+const nativeInitProtoMessageCodec = requireNativeExport('initProtoMessageCodec')
+const nativeEncodeProtoMessageRaw = requireNativeExport('encodeProtoMessageRaw')
+const nativeEncodeProtoMessageWithPad = requireNativeExport('encodeProtoMessageWithPad')
+const nativeDecodeProtoMessageRaw = requireNativeExport('decodeProtoMessageRaw')
+const nativeDecodeProtoMessageFromPadded = requireNativeExport('decodeProtoMessageFromPadded')
+const nativeDecodeProtoMessagesRawBatch = requireNativeExport('decodeProtoMessagesRawBatch')
+const nativeDecodeProtoMessagesFromPaddedBatch = requireNativeExport('decodeProtoMessagesFromPaddedBatch')
+const nativeGenerateParticipantHashV2Fast = requireNativeExport('generateParticipantHashV2Fast')
+
+// Register the WAProto callbacks once so the addon can round-trip messages without per-call JS plumbing.
+const isNativeProtoMessageCodecReady = (() => {
+	const initialized = nativeInitProtoMessageCodec(
+		message => proto.Message.encode(message as proto.IMessage),
+		data => proto.Message.decode(data)
+	)
+	if (!initialized) {
+		throw new Error('Strict native mode failed to initialize proto codec')
+	}
+
+	return true
+})()
 
 export const BufferJSON = {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -55,31 +79,110 @@ export const writeRandomPadMax16 = (msg: Uint8Array) => {
 	const pad = randomBytes(1)
 	const padLength = (pad[0]! & 0x0f) + 1
 
-	return Buffer.concat([msg, Buffer.alloc(padLength, padLength)])
+	return nativePadMessageWithLength(msg, padLength)
 }
 
 export const unpadRandomMax16 = (e: Uint8Array | Buffer) => {
-	const t = new Uint8Array(e)
-	if (0 === t.length) {
-		throw new Error('unpadPkcs7 given empty bytes')
-	}
-
-	var r = t[t.length - 1]!
-	if (r > t.length) {
-		throw new Error(`unpad given ${t.length} bytes, but pad is ${r}`)
-	}
-
-	return new Uint8Array(t.buffer, t.byteOffset, t.length - r)
+	const unpaddedLength = nativeGetUnpaddedLengthMax16(e)
+	return new Uint8Array(e.buffer, e.byteOffset, unpaddedLength)
 }
 
 // code is inspired by whatsmeow
 export const generateParticipantHashV2 = (participants: string[]): string => {
-	participants.sort()
-	const sha256Hash = sha256(Buffer.from(participants.join(''))).toString('base64')
-	return '2:' + sha256Hash.slice(0, 6)
+	return nativeGenerateParticipantHashV2Fast(participants)
 }
 
-export const encodeWAMessage = (message: proto.IMessage) => writeRandomPadMax16(proto.Message.encode(message).finish())
+const encodeProtoMessageRawFast = (message: proto.IMessage): Uint8Array => {
+	if (!isNativeProtoMessageCodecReady) {
+		throw new Error('Strict native mode proto codec is not ready')
+	}
+
+	return nativeEncodeProtoMessageRaw(message)
+}
+
+export const decodeWAMessage = (data: Uint8Array, padded = true): proto.IMessage => {
+	if (padded) {
+		if (!isNativeProtoMessageCodecReady) {
+			throw new Error('Strict native mode proto codec is not ready')
+		}
+
+		return nativeDecodeProtoMessageFromPadded(data) as proto.IMessage
+	}
+
+	if (!isNativeProtoMessageCodecReady) {
+		throw new Error('Strict native mode proto codec is not ready')
+	}
+
+	return nativeDecodeProtoMessageRaw(data) as proto.IMessage
+}
+
+export type WAMessageDecodeBatchItem = {
+	data: Uint8Array
+	padded?: boolean
+}
+
+// Preserve input ordering while splitting padded and raw payloads into the native batch decoders they expect.
+export const decodeWAMessageBatch = (items: readonly WAMessageDecodeBatchItem[]): proto.IMessage[] => {
+	if (!items.length) {
+		return []
+	}
+
+	if (!isNativeProtoMessageCodecReady) {
+		throw new Error('Strict native mode proto codec is not ready')
+	}
+
+	const decoded = new Array<proto.IMessage>(items.length)
+	const paddedInputs: Uint8Array[] = []
+	const paddedIndexes: number[] = []
+	const rawInputs: Uint8Array[] = []
+	const rawIndexes: number[] = []
+
+	for (let i = 0; i < items.length; i += 1) {
+		const item = items[i]!
+		if (item.padded === false) {
+			rawInputs.push(item.data)
+			rawIndexes.push(i)
+		} else {
+			paddedInputs.push(item.data)
+			paddedIndexes.push(i)
+		}
+	}
+
+	if (paddedInputs.length) {
+		const paddedDecoded = nativeDecodeProtoMessagesFromPaddedBatch(paddedInputs) as proto.IMessage[]
+		if (!Array.isArray(paddedDecoded) || paddedDecoded.length !== paddedInputs.length) {
+			throw new Error('native padded batch decoder returned invalid result')
+		}
+
+		for (let i = 0; i < paddedDecoded.length; i += 1) {
+			decoded[paddedIndexes[i]!] = paddedDecoded[i]!
+		}
+	}
+
+	if (rawInputs.length) {
+		const rawDecoded = nativeDecodeProtoMessagesRawBatch(rawInputs) as proto.IMessage[]
+		if (!Array.isArray(rawDecoded) || rawDecoded.length !== rawInputs.length) {
+			throw new Error('native raw batch decoder returned invalid result')
+		}
+
+		for (let i = 0; i < rawDecoded.length; i += 1) {
+			decoded[rawIndexes[i]!] = rawDecoded[i]!
+		}
+	}
+
+	return decoded
+}
+
+export const encodeWAMessage = (message: proto.IMessage) => {
+	const padLength = (randomBytes(1)[0]! & 0x0f) + 1
+
+	// Padding length still comes from JS randomness, but serialization/padding is delegated to native code.
+	if (!isNativeProtoMessageCodecReady) {
+		throw new Error('Strict native mode proto codec is not ready')
+	}
+
+	return nativeEncodeProtoMessageWithPad(message, padLength)
+}
 
 export const generateRegistrationId = (): number => {
 	return Uint16Array.from(randomBytes(2))[0]! & 16383
@@ -96,8 +199,10 @@ export const encodeBigEndian = (e: number, t = 4) => {
 	return a
 }
 
-export const toNumber = (t: Long | number | null | undefined): number =>
-	typeof t === 'object' && t ? ('toNumber' in t ? t.toNumber() : (t as Long).low) : t || 0
+type LongLike = { low: number; toNumber?: () => number }
+
+export const toNumber = (t: LongLike | number | null | undefined): number =>
+	typeof t === 'object' && t ? (typeof t.toNumber === 'function' ? t.toNumber() : t.low) : t || 0
 
 /** unix timestamp of a date in seconds */
 export const unixTimestampSeconds = (date: Date = new Date()) => Math.floor(date.getTime() / 1000)
@@ -470,5 +575,5 @@ export function bytesToCrockford(buffer: Buffer): string {
 }
 
 export function encodeNewsletterMessage(message: proto.IMessage): Uint8Array {
-	return proto.Message.encode(message).finish()
+	return encodeProtoMessageRawFast(message)
 }

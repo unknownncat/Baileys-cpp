@@ -1,3 +1,4 @@
+import { type NativeMessageKeyStore, requireNativeExport } from '../../Native/baileys-native'
 import { SenderChainKey } from './sender-chain-key'
 import { SenderMessageKey } from './sender-message-key'
 
@@ -26,6 +27,9 @@ interface SenderKeyStateStructure {
 export class SenderKeyState {
 	private readonly MAX_MESSAGE_KEYS = 2000
 	private readonly senderKeyStateStructure: SenderKeyStateStructure
+	private readonly nativeMessageKeyStore: NativeMessageKeyStore
+	private readonly onMutate?: () => void
+	private messageKeysDirty = false
 
 	constructor(
 		id?: number | null,
@@ -34,8 +38,11 @@ export class SenderKeyState {
 		signatureKeyPair?: { public: Uint8Array | string; private: Uint8Array | string } | null,
 		signatureKeyPublic?: Uint8Array | string | null,
 		signatureKeyPrivate?: Uint8Array | string | null,
-		senderKeyStateStructure?: SenderKeyStateStructure | null
+		senderKeyStateStructure?: SenderKeyStateStructure | null,
+		onMutate?: () => void
 	) {
+		this.onMutate = onMutate
+
 		if (senderKeyStateStructure) {
 			this.senderKeyStateStructure = {
 				...senderKeyStateStructure,
@@ -62,6 +69,20 @@ export class SenderKeyState {
 				senderMessageKeys: []
 			}
 		}
+
+		const NativeMessageKeyStoreCtor = requireNativeExport('NativeMessageKeyStore')
+		this.nativeMessageKeyStore = new NativeMessageKeyStoreCtor(
+			this.senderKeyStateStructure.senderMessageKeys,
+			this.MAX_MESSAGE_KEYS
+		)
+	}
+
+	private markMutated(messageKeysChanged = false): void {
+		if (messageKeysChanged) {
+			this.messageKeysDirty = true
+		}
+
+		this.onMutate?.()
 	}
 
 	public getKeyId(): number {
@@ -80,6 +101,7 @@ export class SenderKeyState {
 			iteration: chainKey.getIteration(),
 			seed: chainKey.getSeed()
 		}
+		this.markMutated()
 	}
 
 	public getSigningKeyPublic(): Buffer {
@@ -102,33 +124,45 @@ export class SenderKeyState {
 	}
 
 	public hasSenderMessageKey(iteration: number): boolean {
-		return this.senderKeyStateStructure.senderMessageKeys.some(key => key.iteration === iteration)
+		return this.nativeMessageKeyStore.has(iteration)
 	}
 
 	public addSenderMessageKey(senderMessageKey: SenderMessageKey): void {
-		this.senderKeyStateStructure.senderMessageKeys.push({
-			iteration: senderMessageKey.getIteration(),
-			seed: senderMessageKey.getSeed()
-		})
-
-		if (this.senderKeyStateStructure.senderMessageKeys.length > this.MAX_MESSAGE_KEYS) {
-			this.senderKeyStateStructure.senderMessageKeys.shift()
-		}
+		this.nativeMessageKeyStore.add(senderMessageKey.getIteration(), senderMessageKey.getSeed(), this.MAX_MESSAGE_KEYS)
+		this.markMutated(true)
 	}
 
 	public removeSenderMessageKey(iteration: number): SenderMessageKey | null {
-		const index = this.senderKeyStateStructure.senderMessageKeys.findIndex(key => key.iteration === iteration)
-
-		if (index !== -1) {
-			const messageKey = this.senderKeyStateStructure.senderMessageKeys[index]!
-			this.senderKeyStateStructure.senderMessageKeys.splice(index, 1)
-			return new SenderMessageKey(messageKey.iteration, messageKey.seed)
+		const nativeMessageKey = this.nativeMessageKeyStore.remove(iteration)
+		if (nativeMessageKey) {
+			this.markMutated(true)
+			return new SenderMessageKey(nativeMessageKey.iteration, nativeMessageKey.seed)
 		}
 
 		return null
 	}
 
+	public serializeRecordForStorage(): Buffer | undefined {
+		if (!this.nativeMessageKeyStore.encodeSenderKeyRecord) {
+			return undefined
+		}
+
+		const { senderKeyId, senderChainKey, senderSigningKey } = this.senderKeyStateStructure
+		return this.nativeMessageKeyStore.encodeSenderKeyRecord(
+			senderKeyId,
+			senderChainKey.iteration,
+			senderChainKey.seed,
+			senderSigningKey.public,
+			senderSigningKey.private
+		)
+	}
+
 	public getStructure(): SenderKeyStateStructure {
+		if (this.messageKeysDirty) {
+			this.senderKeyStateStructure.senderMessageKeys = this.nativeMessageKeyStore.toArray()
+			this.messageKeysDirty = false
+		}
+
 		return this.senderKeyStateStructure
 	}
 }

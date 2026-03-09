@@ -1,19 +1,80 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from 'crypto'
-import * as curve from 'libsignal/src/curve'
+import { crypto as libsignalCrypto } from 'libsignal'
 import { KEY_BUNDLE_TYPE } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { KeyPair } from '../Types'
-export { md5, hkdf } from 'whatsapp-rust-bridge'
+import {
+	calculateAgreement as bridgeCalculateAgreement,
+	calculateSignature as bridgeCalculateSignature,
+	generateKeyPair as bridgeGenerateKeyPair,
+	hkdf,
+	md5,
+	verifySignature as bridgeVerifySignature
+} from 'whatsapp-rust-bridge'
+export { md5, hkdf }
 
 // insure browser & node compatibility
 const { subtle } = globalThis.crypto
+const nativeGenerateSignalPubKeyFast = requireNativeExport('generateSignalPubKeyFast')
 
 /** prefix version byte to the pub keys, required for some curve crypto functions */
-export const generateSignalPubKey = (pubKey: Uint8Array | Buffer) =>
-	pubKey.length === 33 ? pubKey : Buffer.concat([KEY_BUNDLE_TYPE, pubKey])
+// This keeps libsignal and the Rust bridge aligned on the exact public-key wire format.
+export const generateSignalPubKey = (pubKey: Uint8Array | Buffer) => {
+	const fast = nativeGenerateSignalPubKeyFast(pubKey, KEY_BUNDLE_TYPE[0])
+	if (fast instanceof Uint8Array && fast.length > 0) {
+		return fast
+	}
+
+	throw new Error('native generateSignalPubKeyFast returned invalid payload')
+}
+
+type RawSignalKeyPair = {
+	privKey: Uint8Array
+	pubKey: Uint8Array
+}
+
+export const generateSignalKeyPairRaw = (): RawSignalKeyPair => {
+	return bridgeGenerateKeyPair()
+}
+
+// Keep an in-process HKDF fallback for environments where libsignal's deriveSecrets path is unavailable.
+export const deriveSignalSecrets = (
+	input: Uint8Array,
+	salt: Uint8Array,
+	info: Uint8Array,
+	chunks = 3
+): Uint8Array[] => {
+	const resolvedChunks = chunks as 1 | 2 | 3
+	if (salt.byteLength !== 32) {
+		throw new Error('Got salt of incorrect length')
+	}
+	if (resolvedChunks < 1 || resolvedChunks > 3) {
+		throw new Error('deriveSignalSecrets chunks must be between 1 and 3')
+	}
+
+	try {
+		return libsignalCrypto.deriveSecrets(input, salt, info, resolvedChunks)
+	} catch {
+		const prk = createHmac('sha256', Buffer.from(salt)).update(Buffer.from(input)).digest()
+		const derived: Uint8Array[] = []
+		let previous: Uint8Array<ArrayBufferLike> = Buffer.alloc(0)
+
+		for (let i = 1; i <= resolvedChunks; i += 1) {
+			previous = createHmac('sha256', prk)
+				.update(previous)
+				.update(Buffer.from(info))
+				.update(Buffer.from([i]))
+				.digest()
+			derived.push(previous)
+		}
+
+		return derived
+	}
+}
 
 export const Curve = {
 	generateKeyPair: (): KeyPair => {
-		const { pubKey, privKey } = curve.generateKeyPair()
+		const { pubKey, privKey } = generateSignalKeyPairRaw()
 		return {
 			private: Buffer.from(privKey),
 			// remove version byte
@@ -21,14 +82,13 @@ export const Curve = {
 		}
 	},
 	sharedKey: (privateKey: Uint8Array, publicKey: Uint8Array) => {
-		const shared = curve.calculateAgreement(generateSignalPubKey(publicKey), privateKey)
+		const shared = bridgeCalculateAgreement(generateSignalPubKey(publicKey), privateKey)
 		return Buffer.from(shared)
 	},
-	sign: (privateKey: Uint8Array, buf: Uint8Array) => curve.calculateSignature(privateKey, buf),
+	sign: (privateKey: Uint8Array, buf: Uint8Array) => bridgeCalculateSignature(privateKey, buf),
 	verify: (pubKey: Uint8Array, message: Uint8Array, signature: Uint8Array) => {
 		try {
-			curve.verifySignature(generateSignalPubKey(pubKey), message, signature)
-			return true
+			return bridgeVerifySignature(generateSignalPubKey(pubKey), message, signature)
 		} catch (error) {
 			return false
 		}

@@ -1,4 +1,5 @@
 import { proto } from '../../WAProto/index.js'
+import { requireNativeExport } from '../Native/baileys-native'
 import {
 	type GroupMetadata,
 	type GroupParticipant,
@@ -14,10 +15,23 @@ import {
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
 	getBinaryNodeChildString,
+	isHostedLidUser,
+	isHostedPnUser,
+	isLidUser,
+	isPnUser,
 	jidEncode,
 	jidNormalizedUser
 } from '../WABinary'
 import { makeBusinessSocket } from './business'
+
+const isLidLike = (jid: string | null | undefined): boolean =>
+	!!(isLidUser(jid || undefined) || isHostedLidUser(jid || undefined))
+const isPnLike = (jid: string | null | undefined): boolean =>
+	!!(isPnUser(jid || undefined) || isHostedPnUser(jid || undefined))
+const nativeBuildParticipantNodesFast = requireNativeExport('buildParticipantNodesFast')
+const nativeExtractNodeAttrsFast = requireNativeExport('extractNodeAttrsFast')
+const nativeMapParticipantActionResultsFast = requireNativeExport('mapParticipantActionResultsFast')
+const nativeExtractCommunityLinkedGroupsFast = requireNativeExport('extractCommunityLinkedGroupsFast')
 
 export const makeCommunitiesSocket = (config: SocketConfig) => {
 	const sock = makeBusinessSocket(config)
@@ -151,6 +165,11 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 		},
 		communityCreateGroup: async (subject: string, participants: string[], parentCommunityJid: string) => {
 			const key = generateMessageIDV2()
+			const participantNodes = nativeBuildParticipantNodesFast(participants)
+			if (!Array.isArray(participantNodes)) {
+				throw new Error('native buildParticipantNodesFast returned invalid payload')
+			}
+
 			const result = await communityQuery('@g.us', 'set', [
 				{
 					tag: 'create',
@@ -158,13 +177,7 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 						subject,
 						key
 					},
-					content: [
-						...participants.map(jid => ({
-							tag: 'participant',
-							attrs: { jid }
-						})),
-						{ tag: 'linked_parent', attrs: { jid: parentCommunityJid } }
-					]
+					content: [...(participantNodes as BinaryNode[]), { tag: 'linked_parent', attrs: { jid: parentCommunityJid } }]
 				}
 			])
 			return await parseGroupResult(result)
@@ -228,25 +241,28 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 			// Fetch all subgroups of the community
 			const result = await communityQuery(communityJid, 'get', [{ tag: 'sub_groups', attrs: {} }])
 
-			const linkedGroupsData = []
+			let linkedGroupsData: unknown[] = []
 			const subGroupsNode = getBinaryNodeChild(result, 'sub_groups')
 			if (subGroupsNode) {
 				const groupNodes = getBinaryNodeChildren(subGroupsNode, 'group')
-				for (const groupNode of groupNodes) {
-					linkedGroupsData.push({
-						id: groupNode.attrs.id ? jidEncode(groupNode.attrs.id, 'g.us') : undefined,
-						subject: groupNode.attrs.subject || '',
-						creation: groupNode.attrs.creation ? Number(groupNode.attrs.creation) : undefined,
-						owner: groupNode.attrs.creator ? jidNormalizedUser(groupNode.attrs.creator) : undefined,
-						size: groupNode.attrs.size ? Number(groupNode.attrs.size) : undefined
-					})
+				const extracted = nativeExtractCommunityLinkedGroupsFast(groupNodes as unknown[])
+				if (!Array.isArray(extracted)) {
+					throw new Error('native extractCommunityLinkedGroupsFast returned invalid payload')
 				}
+
+				linkedGroupsData = extracted
 			}
 
 			return {
 				communityJid,
 				isCommunity,
-				linkedGroups: linkedGroupsData
+				linkedGroups: linkedGroupsData as Array<{
+					id?: string
+					subject: string
+					creation?: number
+					owner?: string
+					size?: number
+				}>
 			}
 		},
 		communityRequestParticipantsList: async (jid: string) => {
@@ -258,9 +274,19 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 			])
 			const node = getBinaryNodeChild(result, 'membership_approval_requests')
 			const participants = getBinaryNodeChildren(node, 'membership_approval_request')
-			return participants.map(v => v.attrs)
+			const attrs = nativeExtractNodeAttrsFast(participants as unknown[])
+			if (!Array.isArray(attrs)) {
+				throw new Error('native extractNodeAttrsFast returned invalid payload')
+			}
+
+			return attrs
 		},
 		communityRequestParticipantsUpdate: async (jid: string, participants: string[], action: 'approve' | 'reject') => {
+			const participantNodes = nativeBuildParticipantNodesFast(participants)
+			if (!Array.isArray(participantNodes)) {
+				throw new Error('native buildParticipantNodesFast returned invalid payload')
+			}
+
 			const result = await communityQuery(jid, 'set', [
 				{
 					tag: 'membership_requests_action',
@@ -269,10 +295,7 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 						{
 							tag: action,
 							attrs: {},
-							content: participants.map(jid => ({
-								tag: 'participant',
-								attrs: { jid }
-							}))
+							content: participantNodes as BinaryNode[]
 						}
 					]
 				}
@@ -280,26 +303,34 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 			const node = getBinaryNodeChild(result, 'membership_requests_action')
 			const nodeAction = getBinaryNodeChild(node, action)
 			const participantsAffected = getBinaryNodeChildren(nodeAction, 'participant')
-			return participantsAffected.map(p => {
-				return { status: p.attrs.error || '200', jid: p.attrs.jid }
-			})
+			const mapped = nativeMapParticipantActionResultsFast(participantsAffected as unknown[], false)
+			if (!Array.isArray(mapped)) {
+				throw new Error('native mapParticipantActionResultsFast returned invalid payload')
+			}
+
+			return mapped as Array<{ status: string; jid: string }>
 		},
 		communityParticipantsUpdate: async (jid: string, participants: string[], action: ParticipantAction) => {
+			const participantNodes = nativeBuildParticipantNodesFast(participants)
+			if (!Array.isArray(participantNodes)) {
+				throw new Error('native buildParticipantNodesFast returned invalid payload')
+			}
+
 			const result = await communityQuery(jid, 'set', [
 				{
 					tag: action,
 					attrs: action === 'remove' ? { linked_groups: 'true' } : {},
-					content: participants.map(jid => ({
-						tag: 'participant',
-						attrs: { jid }
-					}))
+					content: participantNodes as BinaryNode[]
 				}
 			])
 			const node = getBinaryNodeChild(result, action)
 			const participantsAffected = getBinaryNodeChildren(node, 'participant')
-			return participantsAffected.map(p => {
-				return { status: p.attrs.error || '200', jid: p.attrs.jid, content: p }
-			})
+			const mapped = nativeMapParticipantActionResultsFast(participantsAffected as unknown[], true)
+			if (!Array.isArray(mapped)) {
+				throw new Error('native mapParticipantActionResultsFast returned invalid payload')
+			}
+
+			return mapped as Array<{ status: string; jid: string; content: BinaryNode }>
 		},
 		communityUpdateDescription: async (jid: string, description?: string) => {
 			const metadata = await communityMetadata(jid)
@@ -390,7 +421,7 @@ export const makeCommunitiesSocket = (config: SocketConfig) => {
 							remoteJid: inviteMessage.groupJid,
 							id: generateMessageIDV2(sock.user?.id),
 							fromMe: false,
-							participant: key.remoteJid // TODO: investigate if this makes any sense at all
+							participant: key.participant || key.remoteJid
 						},
 						messageStubType: WAMessageStubType.GROUP_PARTICIPANT_ADD,
 						messageStubParameters: [JSON.stringify(authState.creds.me)],
@@ -463,13 +494,27 @@ export const extractCommunityMetadata = (result: BinaryNode) => {
 		isCommunityAnnounce: !!getBinaryNodeChild(community, 'default_sub_community'),
 		joinApprovalMode: !!getBinaryNodeChild(community, 'membership_approval_mode'),
 		memberAddMode,
-		participants: getBinaryNodeChildren(community, 'participant').map(({ attrs }) => {
-			return {
-				// TODO: IMPLEMENT THE PN/LID FIELDS HERE!!
-				id: attrs.jid!,
-				admin: (attrs.type || null) as GroupParticipant['admin']
+		participants: getBinaryNodeChildren(community, 'participant').reduce<GroupParticipant[]>((acc, { attrs }) => {
+			const id = attrs.jid || attrs.phone_number || attrs.lid
+			if (!id) {
+				return acc
 			}
-		}),
+
+			const phoneNumber =
+				(isLidLike(attrs.jid) && isPnLike(attrs.phone_number) && attrs.phone_number) ||
+				(isPnLike(attrs.jid) && attrs.jid) ||
+				undefined
+			const lid =
+				(isPnLike(attrs.jid) && isLidLike(attrs.lid) && attrs.lid) || (isLidLike(attrs.jid) && attrs.jid) || undefined
+
+			acc.push({
+				id,
+				phoneNumber,
+				lid,
+				admin: (attrs.type || null) as GroupParticipant['admin']
+			})
+			return acc
+		}, []),
 		ephemeralDuration: eph ? +eph : undefined,
 		addressingMode: getBinaryNodeChildString(community, 'addressing_mode')! as GroupMetadata['addressingMode']
 	}

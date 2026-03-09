@@ -1,3 +1,4 @@
+import type { SerializedSessionRecord } from 'libsignal'
 import type { proto } from '../../WAProto/index.js'
 import type { Contact } from './Contact'
 import type { MinimalMessage } from './Message'
@@ -73,7 +74,7 @@ export type AuthenticationCreds = SignalCreds & {
 
 export type SignalDataTypeMap = {
 	'pre-key': KeyPair
-	session: Uint8Array
+	session: SerializedSessionRecord
 	'sender-key': Uint8Array
 	'sender-key-memory': { [jid: string]: boolean }
 	'app-state-sync-key': proto.Message.IAppStateSyncKeyData

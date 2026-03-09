@@ -2,6 +2,7 @@ import NodeCache from '@cacheable/node-cache'
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
 import { DEFAULT_CACHE_TTLS, PROCESSABLE_HISTORY_TYPES } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	BotListInfo,
 	CacheStore,
@@ -35,6 +36,7 @@ import {
 	decodePatches,
 	decodeSyncdSnapshot,
 	encodeSyncdPatch,
+	encodeSyncdPatchWire,
 	extractSyncdPatches,
 	generateProfilePicture,
 	getHistoryMsg,
@@ -56,6 +58,7 @@ import {
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeSocket } from './socket.js'
 const MAX_SYNC_ATTEMPTS = 2
+const nativeExtractBotListV2Fast = requireNativeExport('extractBotListV2Fast')
 
 export const makeChatsSocket = (config: SocketConfig) => {
 	const {
@@ -67,6 +70,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		shouldSyncHistoryMessage,
 		getMessage
 	} = config
+	const initialSyncTimeoutMs = config.initialSyncTimeoutMs ?? 20_000
 	const sock = makeSocket(config)
 	const {
 		ev,
@@ -227,20 +231,13 @@ export const makeChatsSocket = (config: SocketConfig) => {
 		})
 
 		const botNode = getBinaryNodeChild(resp, 'bot')
-
-		const botList: BotListInfo[] = []
-		for (const section of getBinaryNodeChildren(botNode, 'section')) {
-			if (section.attrs.type === 'all') {
-				for (const bot of getBinaryNodeChildren(section, 'bot')) {
-					botList.push({
-						jid: bot.attrs.jid!,
-						personaId: bot.attrs['persona_id']!
-					})
-				}
-			}
+		const sections = getBinaryNodeChildren(botNode, 'section')
+		const nativeBotList = nativeExtractBotListV2Fast(sections as unknown[])
+		if (!Array.isArray(nativeBotList)) {
+			throw new Boom('native extractBotListV2Fast returned invalid payload', { statusCode: 500 })
 		}
 
-		return botList
+		return nativeBotList as BotListInfo[]
 	}
 
 	const fetchStatus = async (...jids: string[]) => {
@@ -821,7 +818,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 										{
 											tag: 'patch',
 											attrs: {},
-											content: proto.SyncdPatch.encode(patch).finish()
+											content: encodeSyncdPatchWire(patch)
 										}
 									]
 								}
@@ -854,40 +851,58 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 	/** sending non-abt props may fix QR scan fail if server expects */
 	const fetchProps = async () => {
-		//TODO: implement both protocol 1 and protocol 2 prop fetching, specially for abKey for WM
-		const resultNode = await query({
-			tag: 'iq',
-			attrs: {
-				to: S_WHATSAPP_NET,
-				xmlns: 'w',
-				type: 'get'
-			},
-			content: [
-				{
-					tag: 'props',
+		const fetchByProtocol = async (protocol: '1' | '2', hash?: string) => {
+			try {
+				const resultNode = await query({
+					tag: 'iq',
 					attrs: {
-						protocol: '2',
-						hash: authState?.creds?.lastPropHash || ''
-					}
+						to: S_WHATSAPP_NET,
+						xmlns: 'w',
+						type: 'get'
+					},
+					content: [
+						{
+							tag: 'props',
+							attrs: {
+								protocol,
+								hash: hash || ''
+							}
+						}
+					]
+				})
+				const propsNode = getBinaryNodeChild(resultNode, 'props')
+				return {
+					hash: propsNode?.attrs?.hash,
+					props: propsNode ? reduceBinaryNodeToDictionary(propsNode, 'prop') : {}
 				}
-			]
-		})
-
-		const propsNode = getBinaryNodeChild(resultNode, 'props')
-
-		let props: { [_: string]: string } = {}
-		if (propsNode) {
-			if (propsNode.attrs?.hash) {
-				// on some clients, the hash is returning as undefined
-				authState.creds.lastPropHash = propsNode?.attrs?.hash
-				ev.emit('creds.update', authState.creds)
+			} catch (error) {
+				logger.debug({ error, protocol }, 'props fetch failed for protocol')
+				return {
+					hash: undefined,
+					props: {}
+				}
 			}
-
-			props = reduceBinaryNodeToDictionary(propsNode, 'prop')
 		}
 
-		logger.debug('fetched props')
+		const [protocol2, protocol1] = await Promise.all([
+			fetchByProtocol('2', authState?.creds?.lastPropHash || ''),
+			fetchByProtocol('1')
+		])
 
+		if (protocol2.hash && protocol2.hash !== authState.creds.lastPropHash) {
+			authState.creds.lastPropHash = protocol2.hash
+			ev.emit('creds.update', authState.creds)
+		}
+
+		const props = { ...protocol1.props, ...protocol2.props }
+		logger.debug(
+			{
+				propsCount: Object.keys(props).length,
+				protocol1Props: Object.keys(protocol1.props).length,
+				protocol2Props: Object.keys(protocol2.props).length
+			},
+			'fetched props'
+		)
 		return props
 	}
 
@@ -1198,7 +1213,7 @@ export const makeChatsSocket = (config: SocketConfig) => {
 			return
 		}
 
-		logger.info('History sync is enabled, awaiting notification with a 20s timeout.')
+		logger.info({ timeoutMs: initialSyncTimeoutMs }, 'History sync is enabled, awaiting notification timeout.')
 
 		if (awaitingSyncTimeout) {
 			clearTimeout(awaitingSyncTimeout)
@@ -1206,12 +1221,14 @@ export const makeChatsSocket = (config: SocketConfig) => {
 
 		awaitingSyncTimeout = setTimeout(() => {
 			if (syncState === SyncState.AwaitingInitialSync) {
-				// TODO: investigate
-				logger.warn('Timeout in AwaitingInitialSync, forcing state to Online and flushing buffer')
+				logger.warn(
+					{ timeoutMs: initialSyncTimeoutMs },
+					'Timeout in AwaitingInitialSync, forcing state to Online and flushing buffer'
+				)
 				syncState = SyncState.Online
 				ev.flush()
 			}
-		}, 20_000)
+		}, initialSyncTimeoutMs)
 	})
 
 	ev.on('lid-mapping.update', async ({ lid, pn }) => {

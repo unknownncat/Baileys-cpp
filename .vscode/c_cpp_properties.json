@@ -1,0 +1,78 @@
+{
+	"version": 4,
+	"configurations": [
+		{
+			"name": "Win32",
+			"compilerPath": "cl.exe",
+			"intelliSenseMode": "windows-msvc-x64",
+			"cStandard": "c17",
+			"cppStandard": "c++20",
+			"defines": [
+				"NAPI_DISABLE_CPP_EXCEPTIONS",
+				"NODE_ADDON_API_DISABLE_DEPRECATED",
+				"BAILEYS_HAS_NATIVE_WAPROTO=1"
+			],
+			"includePath": [
+				"${workspaceFolder}/native",
+				"${workspaceFolder}/native/generated",
+				"${workspaceFolder}/node_modules/node-addon-api",
+				"${workspaceFolder}/node_modules/node-addon-api/src",
+				"${workspaceFolder}/node_modules/@types/node",
+				"${env:USERPROFILE}/AppData/Local/node-gyp/Cache/**",
+				"${env:VCPKG_ROOT}/installed/x64-windows-static/include",
+				"${env:VCPKG_INSTALLATION_ROOT}/installed/x64-windows-static/include"
+			],
+			"browse": {
+				"path": [
+					"${workspaceFolder}/native",
+					"${workspaceFolder}/native/generated",
+					"${workspaceFolder}/node_modules/node-addon-api",
+					"${workspaceFolder}/node_modules/@types/node",
+					"${env:USERPROFILE}/AppData/Local/node-gyp/Cache/**",
+					"${env:VCPKG_ROOT}/installed/x64-windows-static/include",
+					"${env:VCPKG_INSTALLATION_ROOT}/installed/x64-windows-static/include"
+				]
+			}
+		},
+		{
+			"name": "Linux",
+			"compilerPath": "/usr/bin/clang++",
+			"intelliSenseMode": "linux-clang-x64",
+			"cStandard": "c17",
+			"cppStandard": "c++20",
+			"defines": [
+				"NAPI_DISABLE_CPP_EXCEPTIONS",
+				"NODE_ADDON_API_DISABLE_DEPRECATED",
+				"BAILEYS_HAS_NATIVE_WAPROTO=0"
+			],
+			"includePath": [
+				"${workspaceFolder}/native",
+				"${workspaceFolder}/native/generated",
+				"${workspaceFolder}/node_modules/node-addon-api",
+				"${workspaceFolder}/node_modules/node-addon-api/src",
+				"${workspaceFolder}/node_modules/@types/node",
+				"${env:HOME}/.cache/node-gyp/**"
+			]
+		},
+		{
+			"name": "macOS",
+			"compilerPath": "/usr/bin/clang++",
+			"intelliSenseMode": "macos-clang-arm64",
+			"cStandard": "c17",
+			"cppStandard": "c++20",
+			"defines": [
+				"NAPI_DISABLE_CPP_EXCEPTIONS",
+				"NODE_ADDON_API_DISABLE_DEPRECATED",
+				"BAILEYS_HAS_NATIVE_WAPROTO=0"
+			],
+			"includePath": [
+				"${workspaceFolder}/native",
+				"${workspaceFolder}/native/generated",
+				"${workspaceFolder}/node_modules/node-addon-api",
+				"${workspaceFolder}/node_modules/node-addon-api/src",
+				"${workspaceFolder}/node_modules/@types/node",
+				"${env:HOME}/Library/Caches/node-gyp/**"
+			]
+		}
+	]
+}

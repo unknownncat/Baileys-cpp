@@ -3,9 +3,9 @@ import { createHash } from 'crypto'
 import { createWriteStream, promises as fs } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	CatalogCollection,
-	CatalogStatus,
 	OrderDetails,
 	OrderProduct,
 	Product,
@@ -18,9 +18,19 @@ import { type BinaryNode, getBinaryNodeChild, getBinaryNodeChildren, getBinaryNo
 import { generateMessageIDV2 } from './generics'
 import { getStream, getUrlFromDirectPath } from './messages-media'
 
+const nativeParseProductNodesFast = requireNativeExport('parseProductNodesFast')
+const nativeParseCollectionNodesFast = requireNativeExport('parseCollectionNodesFast')
+const nativeParseOrderProductNodesFast = requireNativeExport('parseOrderProductNodesFast')
+
 export const parseCatalogNode = (node: BinaryNode) => {
 	const catalogNode = getBinaryNodeChild(node, 'product_catalog')
-	const products = getBinaryNodeChildren(catalogNode, 'product').map(parseProductNode)
+	const productNodes = getBinaryNodeChildren(catalogNode, 'product')
+	const productsRaw = nativeParseProductNodesFast(productNodes as unknown[])
+	if (!Array.isArray(productsRaw)) {
+		throw new Error('native parseProductNodesFast returned invalid payload')
+	}
+
+	const products = productsRaw as Product[]
 	const paging = getBinaryNodeChild(catalogNode, 'paging')
 
 	return {
@@ -31,18 +41,13 @@ export const parseCatalogNode = (node: BinaryNode) => {
 
 export const parseCollectionsNode = (node: BinaryNode) => {
 	const collectionsNode = getBinaryNodeChild(node, 'collections')
-	const collections = getBinaryNodeChildren(collectionsNode, 'collection').map<CatalogCollection>(collectionNode => {
-		const id = getBinaryNodeChildString(collectionNode, 'id')!
-		const name = getBinaryNodeChildString(collectionNode, 'name')!
+	const collectionNodes = getBinaryNodeChildren(collectionsNode, 'collection')
+	const collectionsRaw = nativeParseCollectionNodesFast(collectionNodes as unknown[])
+	if (!Array.isArray(collectionsRaw)) {
+		throw new Error('native parseCollectionNodesFast returned invalid payload')
+	}
 
-		const products = getBinaryNodeChildren(collectionNode, 'product').map(parseProductNode)
-		return {
-			id,
-			name,
-			products,
-			status: parseStatusInfo(collectionNode)
-		}
-	})
+	const collections = collectionsRaw as CatalogCollection[]
 
 	return {
 		collections
@@ -51,17 +56,13 @@ export const parseCollectionsNode = (node: BinaryNode) => {
 
 export const parseOrderDetailsNode = (node: BinaryNode) => {
 	const orderNode = getBinaryNodeChild(node, 'order')
-	const products = getBinaryNodeChildren(orderNode, 'product').map<OrderProduct>(productNode => {
-		const imageNode = getBinaryNodeChild(productNode, 'image')!
-		return {
-			id: getBinaryNodeChildString(productNode, 'id')!,
-			name: getBinaryNodeChildString(productNode, 'name')!,
-			imageUrl: getBinaryNodeChildString(imageNode, 'url')!,
-			price: +getBinaryNodeChildString(productNode, 'price')!,
-			currency: getBinaryNodeChildString(productNode, 'currency')!,
-			quantity: +getBinaryNodeChildString(productNode, 'quantity')!
-		}
-	})
+	const productNodes = getBinaryNodeChildren(orderNode, 'product')
+	const productsRaw = nativeParseOrderProductNodesFast(productNodes as unknown[])
+	if (!Array.isArray(productsRaw)) {
+		throw new Error('native parseOrderProductNodesFast returned invalid payload')
+	}
+
+	const products = productsRaw as OrderProduct[]
 
 	const priceNode = getBinaryNodeChild(orderNode, 'price')
 
@@ -274,13 +275,5 @@ const parseImageUrls = (mediaNode: BinaryNode) => {
 	return {
 		requested: getBinaryNodeChildString(imgNode, 'request_image_url')!,
 		original: getBinaryNodeChildString(imgNode, 'original_image_url')!
-	}
-}
-
-const parseStatusInfo = (mediaNode: BinaryNode): CatalogStatus => {
-	const node = getBinaryNodeChild(mediaNode, 'status_info')
-	return {
-		status: getBinaryNodeChildString(node, 'status')!,
-		canAppeal: getBinaryNodeChildString(node, 'can_appeal') === 'true'
 	}
 }

@@ -1,6 +1,6 @@
 import type { USyncQueryProtocol } from '../../Types/USync'
 import { assertNodeErrorFree, type BinaryNode, getBinaryNodeChild } from '../../WABinary'
-//import { USyncUser } from '../USyncUser'
+import type { USyncUser } from '../USyncUser'
 
 export type KeyIndexData = {
 	timestamp: number
@@ -31,11 +31,23 @@ export class USyncDeviceProtocol implements USyncQueryProtocol {
 		}
 	}
 
-	getUserElement(/* user: USyncUser */): BinaryNode | null {
-		//TODO: Implement device phashing, ts and expectedTs
-		//TODO: if all are not present, return null <- current behavior
-		//TODO: otherwise return a node w tag 'devices' w those as attrs
-		return null
+	getUserElement(user: USyncUser): BinaryNode | null {
+		if (
+			!user.devicePhash ||
+			typeof user.deviceTimestamp !== 'number' ||
+			typeof user.deviceExpectedTimestamp !== 'number'
+		) {
+			return null
+		}
+
+		return {
+			tag: 'devices',
+			attrs: {
+				phash: user.devicePhash,
+				ts: `${user.deviceTimestamp}`,
+				expected_ts: `${user.deviceExpectedTimestamp}`
+			}
+		}
 	}
 
 	parser(node: BinaryNode): ParsedDeviceInfo {
@@ -50,7 +62,7 @@ export class USyncDeviceProtocol implements USyncQueryProtocol {
 			if (Array.isArray(deviceListNode?.content)) {
 				for (const { tag, attrs } of deviceListNode.content) {
 					const id = +attrs.id!
-					const keyIndex = +attrs['key-index']!
+					const keyIndex = attrs['key-index'] ? +attrs['key-index'] : undefined
 					if (tag === 'device') {
 						deviceList.push({
 							id,

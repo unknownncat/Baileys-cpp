@@ -11,6 +11,15 @@ import { Readable, Transform } from 'stream'
 import { URL } from 'url'
 import { proto } from '../../WAProto/index.js'
 import { DEFAULT_ORIGIN, MEDIA_HKDF_KEY_MAPPING, MEDIA_PATH_MAP, type MediaType } from '../Defaults'
+import {
+	type NativeBufferBuilder,
+	type NativeHashSpoolWriter,
+	type NativeMediaDecryptPipeline,
+	type NativeMediaEncryptToFile,
+	type NativeMediaEncryptor,
+	getOptionalNativeExport,
+	requireNativeExport
+} from '../Native/baileys-native'
 import type {
 	BaileysEventMap,
 	DownloadableMessage,
@@ -29,7 +38,196 @@ import { aesDecryptGCM, aesEncryptGCM, hkdf } from './crypto'
 import { generateMessageIDV2 } from './generics'
 import type { ILogger } from './logger'
 
+const nativeAnalyzeWavAudioFast = requireNativeExport('analyzeWavAudioFast')
+const NativeBufferBuilderCtor = requireNativeExport('NativeBufferBuilder')
+const NativeMediaEncryptorCtor = requireNativeExport('NativeMediaEncryptor')
+const NativeMediaDecryptPipelineCtor = requireNativeExport('NativeMediaDecryptPipeline')
+const useExperimentalNativeMediaWriters =
+	process.env.BAILEYS_NATIVE_MEDIA_WRITERS === '1' || process.env.BAILEYS_NATIVE_MEDIA_WRITERS === 'true'
+const NativeHashSpoolWriterCtor = useExperimentalNativeMediaWriters ? getOptionalNativeExport('NativeHashSpoolWriter') : undefined
+const NativeMediaEncryptToFileCtor = useExperimentalNativeMediaWriters
+	? getOptionalNativeExport('NativeMediaEncryptToFile')
+	: undefined
+
 const getTmpFilesDirectory = () => tmpdir()
+
+type MediaHashSpoolResult = {
+	fileSha256: Buffer
+	fileLength: number
+}
+
+type MediaHashSpoolWriter = {
+	update(chunk: Uint8Array): void | Promise<void>
+	final(): MediaHashSpoolResult | Promise<MediaHashSpoolResult>
+	abort(): void | Promise<void>
+}
+
+type MediaEncryptToFileResult = {
+	mac: Buffer
+	fileSha256: Buffer
+	fileEncSha256: Buffer
+	fileLength: number
+}
+
+type MediaEncryptToFileWriter = {
+	update(chunk: Uint8Array): void | Promise<void>
+	final(): MediaEncryptToFileResult | Promise<MediaEncryptToFileResult>
+	abort(): void | Promise<void>
+}
+
+const createTempMediaFilePath = (mediaType: MediaType, suffix = '') =>
+	join(getTmpFilesDirectory(), `${mediaType}${generateMessageIDV2()}${suffix}`)
+
+const normalizeReadableChunk = (chunk: Buffer | Uint8Array | string) =>
+	Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+
+const writeChunkToStream = async (stream: WriteStream, chunk: Uint8Array) => {
+	if (!chunk.length) {
+		return
+	}
+
+	if (!stream.write(chunk)) {
+		await once(stream, 'drain')
+	}
+}
+
+const closeWriteStream = async (stream?: WriteStream) => {
+	if (!stream) {
+		return
+	}
+
+	const finishPromise = once(stream, 'finish')
+	stream.end()
+	await finishPromise
+}
+
+const safeUnlink = async (filePath?: string) => {
+	if (!filePath) {
+		return
+	}
+
+	try {
+		await fs.unlink(filePath)
+	} catch {
+		//
+	}
+}
+
+const consumeReadableStream = async (stream: Readable, onChunk: (chunk: Buffer) => Promise<void>) => {
+	try {
+		for await (const rawChunk of stream) {
+			await onChunk(normalizeReadableChunk(rawChunk as Buffer | Uint8Array | string))
+		}
+	} finally {
+		stream.destroy()
+	}
+}
+
+const createJsHashSpoolWriter = (filePath: string): MediaHashSpoolWriter => {
+	const hasher = Crypto.createHash('sha256')
+	const fileWriteStream = createWriteStream(filePath)
+	let fileLength = 0
+
+	return {
+		async update(chunk) {
+			fileLength += chunk.length
+			hasher.update(chunk)
+			await writeChunkToStream(fileWriteStream, chunk)
+		},
+		async final() {
+			await closeWriteStream(fileWriteStream)
+			return {
+				fileSha256: hasher.digest(),
+				fileLength
+			}
+		},
+		async abort() {
+			fileWriteStream.destroy()
+			await safeUnlink(filePath)
+		}
+	}
+}
+
+const createHashSpoolWriter = (filePath: string): MediaHashSpoolWriter => {
+	if (NativeHashSpoolWriterCtor) {
+		const nativeWriter: NativeHashSpoolWriter = new NativeHashSpoolWriterCtor(filePath)
+		return {
+			update: chunk => nativeWriter.update(chunk),
+			final: () => nativeWriter.final(),
+			abort: () => nativeWriter.abort()
+		}
+	}
+
+	return createJsHashSpoolWriter(filePath)
+}
+
+const createJsMediaEncryptToFileWriter = (
+	cipherKey: Uint8Array,
+	iv: Uint8Array,
+	macKey: Uint8Array,
+	encFilePath: string,
+	originalFilePath?: string
+): MediaEncryptToFileWriter => {
+	const encFileWriteStream = createWriteStream(encFilePath)
+	const originalFileStream = originalFilePath ? createWriteStream(originalFilePath) : undefined
+	const nativeEncryptor: NativeMediaEncryptor = new NativeMediaEncryptorCtor(cipherKey, iv, macKey)
+	let fileLength = 0
+
+	return {
+		async update(chunk) {
+			fileLength += chunk.length
+
+			if (originalFileStream) {
+				await writeChunkToStream(originalFileStream, chunk)
+			}
+
+			await writeChunkToStream(encFileWriteStream, nativeEncryptor.update(chunk))
+		},
+		async final() {
+			const finalResult = nativeEncryptor.final()
+			await writeChunkToStream(encFileWriteStream, finalResult.finalChunk)
+			await writeChunkToStream(encFileWriteStream, finalResult.mac)
+			await Promise.all([closeWriteStream(encFileWriteStream), closeWriteStream(originalFileStream)])
+
+			return {
+				mac: finalResult.mac,
+				fileSha256: finalResult.fileSha256,
+				fileEncSha256: finalResult.fileEncSha256,
+				fileLength
+			}
+		},
+		async abort() {
+			encFileWriteStream.destroy()
+			originalFileStream?.destroy?.()
+			await Promise.all([safeUnlink(encFilePath), safeUnlink(originalFilePath)])
+		}
+	}
+}
+
+const createMediaEncryptToFileWriter = (
+	cipherKey: Uint8Array,
+	iv: Uint8Array,
+	macKey: Uint8Array,
+	encFilePath: string,
+	originalFilePath?: string
+): MediaEncryptToFileWriter => {
+	if (NativeMediaEncryptToFileCtor) {
+		const nativeWriter: NativeMediaEncryptToFile = new NativeMediaEncryptToFileCtor(
+			cipherKey,
+			iv,
+			macKey,
+			encFilePath,
+			originalFilePath
+		)
+		return {
+			update: chunk => nativeWriter.update(chunk),
+			final: () => nativeWriter.final(),
+			abort: () => nativeWriter.abort()
+		}
+	}
+
+	return createJsMediaEncryptToFileWriter(cipherKey, iv, macKey, encFilePath, originalFilePath)
+}
 
 const getImageProcessingLibrary = async () => {
 	//@ts-ignore
@@ -55,24 +253,14 @@ export const getRawMediaUploadData = async (media: WAMediaUpload, mediaType: Med
 	const { stream } = await getStream(media)
 	logger?.debug('got stream for raw upload')
 
-	const hasher = Crypto.createHash('sha256')
-	const filePath = join(tmpdir(), mediaType + generateMessageIDV2())
-	const fileWriteStream = createWriteStream(filePath)
+	const filePath = createTempMediaFilePath(mediaType)
+	const writer = createHashSpoolWriter(filePath)
 
-	let fileLength = 0
 	try {
-		for await (const data of stream) {
-			fileLength += data.length
-			hasher.update(data)
-			if (!fileWriteStream.write(data)) {
-				await once(fileWriteStream, 'drain')
-			}
-		}
-
-		fileWriteStream.end()
-		await once(fileWriteStream, 'finish')
-		stream.destroy()
-		const fileSha256 = hasher.digest()
+		await consumeReadableStream(stream, async data => {
+			await writer.update(data)
+		})
+		const { fileSha256, fileLength } = await writer.final()
 		logger?.debug('hashed data for raw upload')
 		return {
 			filePath: filePath,
@@ -80,14 +268,7 @@ export const getRawMediaUploadData = async (media: WAMediaUpload, mediaType: Med
 			fileLength
 		}
 	} catch (error) {
-		fileWriteStream.destroy()
-		stream.destroy()
-		try {
-			await fs.unlink(filePath)
-		} catch {
-			//
-		}
-
+		await writer.abort()
 		throw error
 	}
 }
@@ -133,8 +314,7 @@ const extractVideoThumb = async (
 	})
 
 export const extractImageThumb = async (bufferOrFilePath: Readable | Buffer | string, width = 32) => {
-	// TODO: Move entirely to sharp, removing jimp as it supports readable streams
-	// This will have positive speed and performance impacts as well as minimizing RAM usage.
+	// Prefer sharp when available; keep jimp fallback for environments without sharp.
 	if (bufferOrFilePath instanceof Readable) {
 		bufferOrFilePath = await toBuffer(bufferOrFilePath)
 	}
@@ -221,7 +401,31 @@ export const mediaMessageSHA256B64 = (message: WAMessageContent) => {
 	return media?.fileSha256 && Buffer.from(media.fileSha256).toString('base64')
 }
 
+const tryNativeAnalyzeWavAudio = (data: Uint8Array, sampleCount?: number) => {
+	const analyzed = nativeAnalyzeWavAudioFast(data, sampleCount)
+	if (analyzed && typeof analyzed.durationSec === 'number') {
+		return analyzed
+	}
+
+	throw new Error('native analyzeWavAudioFast returned invalid payload')
+}
+
 export async function getAudioDuration(buffer: Buffer | string | Readable) {
+	if (Buffer.isBuffer(buffer)) {
+		const analyzed = tryNativeAnalyzeWavAudio(buffer)
+		if (analyzed) {
+			return analyzed.durationSec
+		}
+	} else if (typeof buffer === 'string' && buffer.toLowerCase().endsWith('.wav')) {
+		try {
+			const wavBuffer = await fs.readFile(buffer)
+			const analyzed = tryNativeAnalyzeWavAudio(wavBuffer)
+			if (analyzed) {
+				return analyzed.durationSec
+			}
+		} catch {}
+	}
+
 	const musicMetadata = await import('music-metadata')
 	let metadata: IAudioMetadata
 	const options = {
@@ -243,8 +447,6 @@ export async function getAudioDuration(buffer: Buffer | string | Readable) {
  */
 export async function getAudioWaveform(buffer: Buffer | string | Readable, logger?: ILogger) {
 	try {
-		// @ts-ignore
-		const { default: decoder } = await import('audio-decode')
 		let audioData: Buffer
 		if (Buffer.isBuffer(buffer)) {
 			audioData = buffer
@@ -255,6 +457,13 @@ export async function getAudioWaveform(buffer: Buffer | string | Readable, logge
 			audioData = await toBuffer(buffer)
 		}
 
+		const nativeAnalyzed = tryNativeAnalyzeWavAudio(audioData, 64)
+		if (nativeAnalyzed?.waveform) {
+			return new Uint8Array(nativeAnalyzed.waveform)
+		}
+
+		// @ts-ignore
+		const { default: decoder } = await import('audio-decode')
 		const audioBuffer = await decoder(audioData)
 
 		const rawData = audioBuffer.getChannelData(0) // We only need to work with one channel of data
@@ -292,13 +501,13 @@ export const toReadable = (buffer: Buffer) => {
 }
 
 export const toBuffer = async (stream: Readable) => {
-	const chunks: Buffer[] = []
+	const builder: NativeBufferBuilder = new NativeBufferBuilderCtor()
 	for await (const chunk of stream) {
-		chunks.push(chunk)
+		builder.append(chunk)
 	}
 
 	stream.destroy()
-	return Buffer.concat(chunks)
+	return builder.toBuffer(true)
 }
 
 export const getStream = async (item: WAMediaUpload, opts?: RequestInit & { maxContentLength?: number }) => {
@@ -394,77 +603,27 @@ export const encryptedStream = async (
 	const mediaKey = Crypto.randomBytes(32)
 	const { cipherKey, iv, macKey } = await getMediaKeys(mediaKey, mediaType)
 
-	const encFilePath = join(getTmpFilesDirectory(), mediaType + generateMessageIDV2() + '-enc')
-	const encFileWriteStream = createWriteStream(encFilePath)
-
-	let originalFileStream: WriteStream | undefined
-	let originalFilePath: string | undefined
-
-	if (saveOriginalFileIfRequired) {
-		originalFilePath = join(getTmpFilesDirectory(), mediaType + generateMessageIDV2() + '-original')
-		originalFileStream = createWriteStream(originalFilePath)
-	}
-
-	let fileLength = 0
-	const aes = Crypto.createCipheriv('aes-256-cbc', cipherKey, iv)
-	const hmac = Crypto.createHmac('sha256', macKey!).update(iv)
-	const sha256Plain = Crypto.createHash('sha256')
-	const sha256Enc = Crypto.createHash('sha256')
-
-	const onChunk = async (buff: Buffer) => {
-		sha256Enc.update(buff)
-		hmac.update(buff)
-		// Handle backpressure: if write returns false, wait for drain
-		if (!encFileWriteStream.write(buff)) {
-			await once(encFileWriteStream, 'drain')
-		}
-	}
+	const encFilePath = createTempMediaFilePath(mediaType, '-enc')
+	const originalFilePath = saveOriginalFileIfRequired ? createTempMediaFilePath(mediaType, '-original') : undefined
+	const writer = createMediaEncryptToFileWriter(cipherKey, iv, macKey!, encFilePath, originalFilePath)
+	let totalBytesRead = 0
 
 	try {
-		for await (const data of stream) {
-			fileLength += data.length
-
+		await consumeReadableStream(stream, async data => {
+			totalBytesRead += data.length
 			if (
 				type === 'remote' &&
 				(opts as any)?.maxContentLength &&
-				fileLength + data.length > (opts as any).maxContentLength
+				totalBytesRead > (opts as any).maxContentLength
 			) {
 				throw new Boom(`content length exceeded when encrypting "${type}"`, {
 					data: { media, type }
 				})
 			}
 
-			if (originalFileStream) {
-				if (!originalFileStream.write(data)) {
-					await once(originalFileStream, 'drain')
-				}
-			}
-
-			sha256Plain.update(data)
-			await onChunk(aes.update(data))
-		}
-
-		await onChunk(aes.final())
-
-		const mac = hmac.digest().slice(0, 10)
-		sha256Enc.update(mac)
-
-		const fileSha256 = sha256Plain.digest()
-		const fileEncSha256 = sha256Enc.digest()
-
-		encFileWriteStream.write(mac)
-
-		const encFinishPromise = once(encFileWriteStream, 'finish')
-		const originalFinishPromise = originalFileStream ? once(originalFileStream, 'finish') : Promise.resolve()
-
-		encFileWriteStream.end()
-		originalFileStream?.end?.()
-		stream.destroy()
-
-		// Wait for write streams to fully flush to disk
-		// This helps reduce memory pressure by allowing OS to release buffers
-		await encFinishPromise
-		await originalFinishPromise
+			await writer.update(data)
+		})
+		const { mac, fileSha256, fileEncSha256, fileLength } = await writer.final()
 
 		logger?.debug('encrypted data successfully')
 
@@ -478,20 +637,8 @@ export const encryptedStream = async (
 			fileLength
 		}
 	} catch (error) {
-		// destroy all streams with error
-		encFileWriteStream.destroy()
-		originalFileStream?.destroy?.()
-		aes.destroy()
-		hmac.destroy()
-		sha256Plain.destroy()
-		sha256Enc.destroy()
-		stream.destroy()
-
 		try {
-			await fs.unlink(encFilePath)
-			if (originalFilePath) {
-				await fs.unlink(originalFilePath)
-			}
+			await writer.abort()
 		} catch (err) {
 			logger?.error({ err }, 'failed deleting tmp files')
 		}
@@ -540,12 +687,14 @@ export const downloadEncryptedContent = async (
 	{ cipherKey, iv }: MediaDecryptionKeyInfo,
 	{ startByte, endByte, options }: MediaDownloadOptions = {}
 ) => {
+	const hasStartByte = typeof startByte === 'number' && startByte > 0
+	const hasEndByte = typeof endByte === 'number'
 	let bytesFetched = 0
 	let startChunk = 0
 	let firstBlockIsIV = false
 	// if a start byte is specified -- then we need to fetch the previous chunk as that will form the IV
-	if (startByte) {
-		const chunk = toSmallestChunkSize(startByte || 0)
+	if (hasStartByte) {
+		const chunk = toSmallestChunkSize(startByte)
 		if (chunk) {
 			startChunk = chunk - AES_CHUNK_SIZE
 			bytesFetched = chunk
@@ -554,7 +703,7 @@ export const downloadEncryptedContent = async (
 		}
 	}
 
-	const endChunk = endByte ? toSmallestChunkSize(endByte || 0) + AES_CHUNK_SIZE : undefined
+	const endChunk = hasEndByte ? toSmallestChunkSize(endByte) + AES_CHUNK_SIZE : undefined
 
 	const headersInit = options?.headers ? options.headers : undefined
 	const headers: Record<string, string> = {
@@ -568,7 +717,7 @@ export const downloadEncryptedContent = async (
 	if (startChunk || endChunk) {
 		headers.Range = `bytes=${startChunk}-`
 		if (endChunk) {
-			headers.Range += endChunk
+			headers.Range += `${Math.max(startChunk, endChunk - 1)}`
 		}
 	}
 
@@ -578,48 +727,22 @@ export const downloadEncryptedContent = async (
 		headers
 	})
 
-	let remainingBytes = Buffer.from([])
-
-	let aes: Crypto.Decipher
-
-	const pushBytes = (bytes: Buffer, push: (bytes: Buffer) => void) => {
-		if (startByte || endByte) {
-			const start = bytesFetched >= startByte! ? undefined : Math.max(startByte! - bytesFetched, 0)
-			const end = bytesFetched + bytes.length < endByte! ? undefined : Math.max(endByte! - bytesFetched, 0)
-
-			push(bytes.slice(start, end))
-
-			bytesFetched += bytes.length
-		} else {
-			push(bytes)
-		}
-	}
+	const nativeDecryptPipeline: NativeMediaDecryptPipeline = new NativeMediaDecryptPipelineCtor(cipherKey, iv, {
+		firstBlockIsIV: firstBlockIsIV,
+		autoPadding: !hasEndByte,
+		startByte,
+		endByte,
+		initialOffset: bytesFetched
+	})
 
 	const output = new Transform({
 		transform(chunk, _, callback) {
-			let data = Buffer.concat([remainingBytes, chunk])
-
-			const decryptLength = toSmallestChunkSize(data.length)
-			remainingBytes = data.slice(decryptLength)
-			data = data.slice(0, decryptLength)
-
-			if (!aes) {
-				let ivValue = iv
-				if (firstBlockIsIV) {
-					ivValue = data.slice(0, AES_CHUNK_SIZE)
-					data = data.slice(AES_CHUNK_SIZE)
-				}
-
-				aes = Crypto.createDecipheriv('aes-256-cbc', cipherKey, ivValue)
-				// if an end byte that is not EOF is specified
-				// stop auto padding (PKCS7) -- otherwise throws an error for decryption
-				if (endByte) {
-					aes.setAutoPadding(false)
-				}
-			}
-
 			try {
-				pushBytes(aes.update(data), b => this.push(b))
+				const decrypted = nativeDecryptPipeline.update(chunk)
+				if (decrypted.length > 0) {
+					this.push(decrypted)
+				}
+
 				callback()
 			} catch (error: any) {
 				callback(error)
@@ -627,7 +750,11 @@ export const downloadEncryptedContent = async (
 		},
 		final(callback) {
 			try {
-				pushBytes(aes.final(), b => this.push(b))
+				const finalBytes = nativeDecryptPipeline.final()
+				if (finalBytes.length > 0) {
+					this.push(finalBytes)
+				}
+
 				callback()
 			} catch (error: any) {
 				callback(error)

@@ -2,8 +2,10 @@ import NodeCache from '@cacheable/node-cache'
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
 import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
+import { type NativeEncryptedParticipantInput, requireNativeExport } from '../Native/baileys-native'
 import type {
 	AnyMessageContent,
+	GroupParticipant,
 	MediaConnInfo,
 	MessageReceiptType,
 	MessageRelayOptions,
@@ -34,7 +36,6 @@ import {
 	unixTimestampSeconds
 } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
-import { makeKeyedMutex } from '../Utils/make-mutex'
 import { getMessageReportingToken, shouldIncludeReportingToken } from '../Utils/reporting-utils'
 import {
 	areJidsSameUser,
@@ -56,6 +57,9 @@ import {
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeNewsletterSocket } from './newsletter'
+
+// Native participant-node assembly removes the per-recipient JS tree-building cost after encryption.
+const nativeBuildParticipantNodesBatch = requireNativeExport('buildParticipantNodesBatch')
 
 export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
@@ -97,8 +101,95 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	// Initialize message retry manager if enabled
 	const messageRetryManager = enableRecentMessageCache ? new MessageRetryManager(logger, maxMsgRetryCount) : null
 
-	// Prevent race conditions in Signal session encryption by user
-	const encryptionMutex = makeKeyedMutex()
+	const profilePicUrlCache = new NodeCache<string | null>({
+		stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES,
+		useClones: false
+	})
+	const groupMetadataCache = new NodeCache<Awaited<ReturnType<typeof groupMetadata>>>({
+		stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES,
+		useClones: false
+	})
+
+	const isLidLike = (jid: string | null | undefined): boolean =>
+		!!(isLidUser(jid || undefined) || isHostedLidUser(jid || undefined))
+	const isPnLike = (jid: string | null | undefined): boolean =>
+		!!(isPnUser(jid || undefined) || isHostedPnUser(jid || undefined))
+
+	const getCachedProfilePicUrl = async (jid: string, type: 'image' | 'preview') => {
+		const cacheKey = `${jid}:${type}`
+		const cached = await profilePicUrlCache.get(cacheKey)
+		if (typeof cached !== 'undefined') {
+			return cached || undefined
+		}
+
+		const value = await sock.profilePictureUrl(jid, type)
+		await profilePicUrlCache.set(cacheKey, value || null)
+		return value
+	}
+
+	// Mirror sender-key memory across PN/LID aliases so group fan-out does not re-bootstrap the same device twice.
+	const expandSenderKeyMapWithAlternateAddressing = (
+		senderKeyMap: Record<string, boolean>,
+		participants: GroupParticipant[] = []
+	) => {
+		if (!participants.length || !Object.keys(senderKeyMap).length) {
+			return senderKeyMap
+		}
+
+		const pnToLidByUser = new Map<string, string>()
+		const lidToPnByUser = new Map<string, string>()
+		for (const participant of participants) {
+			if (participant.phoneNumber && participant.lid) {
+				const pnUser = jidDecode(participant.phoneNumber)?.user
+				const lidUser = jidDecode(participant.lid)?.user
+				if (pnUser && lidUser) {
+					pnToLidByUser.set(pnUser, participant.lid)
+					lidToPnByUser.set(lidUser, participant.phoneNumber)
+				}
+			}
+		}
+
+		if (!pnToLidByUser.size && !lidToPnByUser.size) {
+			return senderKeyMap
+		}
+
+		for (const [existingJid, hasKey] of Object.entries(senderKeyMap)) {
+			if (!hasKey) {
+				continue
+			}
+
+			const decoded = jidDecode(existingJid)
+			if (!decoded) {
+				continue
+			}
+
+			if (isPnLike(existingJid)) {
+				const lidForUser = pnToLidByUser.get(decoded.user)
+				const lidDecoded = lidForUser ? jidDecode(lidForUser) : undefined
+				if (lidDecoded) {
+					const lidAlias = jidEncode(lidDecoded.user, lidDecoded.server, decoded.device)
+					if (!(lidAlias in senderKeyMap)) {
+						senderKeyMap[lidAlias] = true
+					}
+				}
+
+				continue
+			}
+
+			if (isLidLike(existingJid)) {
+				const pnForUser = lidToPnByUser.get(decoded.user)
+				const pnDecoded = pnForUser ? jidDecode(pnForUser) : undefined
+				if (pnDecoded) {
+					const pnAlias = jidEncode(pnDecoded.user, pnDecoded.server, decoded.device)
+					if (!(pnAlias in senderKeyMap)) {
+						senderKeyMap[pnAlias] = true
+					}
+				}
+			}
+		}
+
+		return senderKeyMap
+	}
 
 	let mediaConn: Promise<MediaConnInfo>
 	const refreshMediaConn = async (forceGet = false) => {
@@ -115,14 +206,16 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					content: [{ tag: 'media_conn', attrs: {} }]
 				})
 				const mediaConnNode = getBinaryNodeChild(result, 'media_conn')!
-				// TODO: explore full length of data that whatsapp provides
 				const node: MediaConnInfo = {
-					hosts: getBinaryNodeChildren(mediaConnNode, 'host').map(({ attrs }) => ({
-						hostname: attrs.hostname!,
-						maxContentLengthBytes: +attrs.maxContentLengthBytes!
-					})),
+					hosts: getBinaryNodeChildren(mediaConnNode, 'host')
+						.map(({ attrs }) => ({
+							hostname: attrs.hostname || attrs.fallback_hostname || attrs.ipv4 || attrs.ipv6 || '',
+							maxContentLengthBytes: +(attrs.maxContentLengthBytes || attrs.max_content_length_bytes || 0),
+							attrs
+						}))
+						.filter(host => !!host.hostname),
 					auth: mediaConnNode.attrs.auth!,
-					ttl: +mediaConnNode.attrs.ttl!,
+					ttl: +(mediaConnNode.attrs.ttl || 60),
 					fetchDate: new Date()
 				}
 				logger.debug('fetched media conn')
@@ -289,21 +382,32 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const query = new USyncQuery().withContext('message').withDeviceProtocol().withLIDProtocol()
 
 		for (const jid of toFetch) {
-			query.withUser(new USyncUser().withId(jid)) // todo: investigate - the idea here is that <user> should have an inline lid field with the lid being the pn equivalent
+			const userQuery = new USyncUser().withId(jid)
+			if (isLidLike(jid)) {
+				userQuery.withLid(jid)
+			}
+
+			query.withUser(userQuery)
 		}
 
 		const result = await sock.executeUSyncQuery(query)
 
 		if (result) {
-			// TODO: LID MAP this stuff (lid protocol will now return lid with devices)
-			const lidResults = result.list.filter(a => !!a.lid)
+			const lidResults = [...result.list, ...result.sideList].filter(
+				(a): a is { id: string; lid: string } => typeof a.id === 'string' && typeof a.lid === 'string'
+			)
 			if (lidResults.length > 0) {
 				logger.trace('Storing LID maps from device call')
-				await signalRepository.lidMapping.storeLIDPNMappings(lidResults.map(a => ({ lid: a.lid as string, pn: a.id })))
+				const mappings = lidResults
+					.filter(item => isPnLike(item.id) && isLidLike(item.lid))
+					.map(item => ({ lid: item.lid, pn: item.id }))
+				if (mappings.length > 0) {
+					await signalRepository.lidMapping.storeLIDPNMappings(mappings)
+				}
 
 				// Force-refresh sessions for newly mapped LIDs to align identity addressing
 				try {
-					const lids = lidResults.map(a => a.lid as string)
+					const lids = lidResults.map(a => a.lid)
 					if (lids.length) {
 						await assertSessions(lids, true)
 					}
@@ -327,11 +431,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 			// Process each user's devices as a group for bulk LID migration
 			for (const [user, userDevices] of Object.entries(deviceMap)) {
-				const isLidUser = requestedLidUsers.has(user)
+				const useLidAddressing = requestedLidUsers.has(user)
 
 				// Process all devices for this user
 				for (const item of userDevices) {
-					const finalJid = isLidUser
+					const finalJid = useLidAddressing
 						? jidEncode(user, item.server, item.device)
 						: jidEncode(item.user, item.server, item.device)
 
@@ -345,7 +449,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							user: item.user,
 							device: item.device,
 							finalJid,
-							usedLid: isLidUser
+							usedLid: useLidAddressing
 						},
 						'Processed device with LID priority'
 					)
@@ -485,45 +589,48 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return didFetchNewSession
 	}
 
-	const sendPeerDataOperationMessage = async (
-		pdoMessage: proto.Message.IPeerDataOperationRequestMessage
-	): Promise<string> => {
-		//TODO: for later, abstract the logic to send a Peer Message instead of just PDO - useful for App State Key Resync with phone
+	const sendPeerProtocolMessage = async (protocolMessage: proto.Message.IProtocolMessage): Promise<string> => {
 		if (!authState.creds.me?.id) {
 			throw new Boom('Not authenticated')
 		}
 
-		const protocolMessage: proto.IMessage = {
-			protocolMessage: {
-				peerDataOperationRequestMessage: pdoMessage,
-				type: proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE
-			}
-		}
-
 		const meJid = jidNormalizedUser(authState.creds.me.id)
-
-		const msgId = await relayMessage(meJid, protocolMessage, {
-			additionalAttributes: {
-				category: 'peer',
-
-				push_priority: 'high_force'
+		return relayMessage(
+			meJid,
+			{
+				protocolMessage
 			},
-			additionalNodes: [
-				{
-					tag: 'meta',
-					attrs: { appdata: 'default' }
-				}
-			]
-		})
+			{
+				additionalAttributes: {
+					category: 'peer',
 
-		return msgId
+					push_priority: 'high_force'
+				},
+				additionalNodes: [
+					{
+						tag: 'meta',
+						attrs: { appdata: 'default' }
+					}
+				]
+			}
+		)
+	}
+
+	const sendPeerDataOperationMessage = async (
+		pdoMessage: proto.Message.IPeerDataOperationRequestMessage
+	): Promise<string> => {
+		return sendPeerProtocolMessage({
+			peerDataOperationRequestMessage: pdoMessage,
+			type: proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_MESSAGE
+		})
 	}
 
 	const createParticipantNodes = async (
 		recipientJids: string[],
 		message: proto.IMessage,
 		extraAttrs?: BinaryNode['attrs'],
-		dsmMessage?: proto.IMessage
+		dsmMessage?: proto.IMessage,
+		encodeMessage: (message: proto.IMessage) => Uint8Array = encodeWAMessage
 	) => {
 		if (!recipientJids.length) {
 			return { nodes: [] as BinaryNode[], shouldIncludeDeviceIdentity: false }
@@ -534,70 +641,114 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			? patched
 			: recipientJids.map(jid => ({ recipientJid: jid, message: patched }))
 
-		let shouldIncludeDeviceIdentity = false
 		const meId = authState.creds.me!.id
 		const meLid = authState.creds.me?.lid
 		const meLidUser = meLid ? jidDecode(meLid)?.user : null
-
-		const encryptionPromises = (patchedMessages as any).map(
-			async ({ recipientJid: jid, message: patchedMessage }: any) => {
-				try {
-					if (!jid) return null
-
-					let msgToEncrypt = patchedMessage
-
-					if (dsmMessage) {
-						const { user: targetUser } = jidDecode(jid)!
-						const { user: ownPnUser } = jidDecode(meId)!
-						const ownLidUser = meLidUser
-
-						const isOwnUser = targetUser === ownPnUser || (ownLidUser && targetUser === ownLidUser)
-						const isExactSenderDevice = jid === meId || (meLid && jid === meLid)
-
-						if (isOwnUser && !isExactSenderDevice) {
-							msgToEncrypt = dsmMessage
-							logger.debug({ jid, targetUser }, 'Using DSM for own device')
-						}
-					}
-
-					const bytes = encodeWAMessage(msgToEncrypt)
-					const mutexKey = jid
-
-					const node = await encryptionMutex.mutex(mutexKey, async () => {
-						const { type, ciphertext } = await signalRepository.encryptMessage({ jid, data: bytes })
-
-						if (type === 'pkmsg') {
-							shouldIncludeDeviceIdentity = true
-						}
-
-						return {
-							tag: 'to',
-							attrs: { jid },
-							content: [
-								{
-									tag: 'enc',
-									attrs: { v: '2', type, ...(extraAttrs || {}) },
-									content: ciphertext
-								}
-							]
-						}
-					})
-
-					return node
-				} catch (err) {
-					logger.error({ jid, err }, 'Failed to encrypt for recipient')
-					return null
-				}
+		const encodedMessageCache = new WeakMap<object, Uint8Array>()
+		const getEncodedMessage = (msg: proto.IMessage) => {
+			const key = msg as object
+			const cached = encodedMessageCache.get(key)
+			if (cached) {
+				return cached
 			}
-		)
 
-		const nodes = (await Promise.all(encryptionPromises)).filter(node => node !== null) as BinaryNode[]
+			const encoded = encodeMessage(msg)
+			encodedMessageCache.set(key, encoded)
+			return encoded
+		}
 
-		if (recipientJids.length > 0 && nodes.length === 0) {
+		const encryptionInputs: { jid: string; data: Uint8Array }[] = []
+		for (const { recipientJid: jid, message: patchedMessage } of patchedMessages as any[]) {
+			if (!jid) {
+				continue
+			}
+
+			try {
+				let msgToEncrypt = patchedMessage
+				if (dsmMessage) {
+					const { user: targetUser } = jidDecode(jid)!
+					const { user: ownPnUser } = jidDecode(meId)!
+					const ownLid = meLidUser
+					const isOwnUser = targetUser === ownPnUser || (ownLid && targetUser === ownLid)
+					const isExactSenderDevice = jid === meId || (meLid && jid === meLid)
+					if (isOwnUser && !isExactSenderDevice) {
+						msgToEncrypt = dsmMessage
+						logger.debug({ jid, targetUser }, 'Using DSM for own device')
+					}
+				}
+
+				encryptionInputs.push({
+					jid,
+					data: getEncodedMessage(msgToEncrypt)
+				})
+			} catch (err) {
+				logger.error({ jid, err }, 'Failed to prepare encryption payload for recipient')
+			}
+		}
+
+		const encryptedItems: NativeEncryptedParticipantInput[] = []
+		if (encryptionInputs.length > 0) {
+			// Strict native mode expects repository-level batch encryption instead of per-recipient JS mutex work.
+			if (!signalRepository.encryptMessagesBatch) {
+				throw new Boom('strict native mode requires encryptMessagesBatch', { statusCode: 500 })
+			}
+
+			const batched = await signalRepository.encryptMessagesBatch(encryptionInputs)
+			if (!Array.isArray(batched) || batched.length !== encryptionInputs.length) {
+				throw new Boom('native batch encryption returned invalid payload size', {
+					statusCode: 500,
+					data: {
+						inputs: encryptionInputs.length,
+						outputs: Array.isArray(batched) ? batched.length : 'invalid'
+					}
+				})
+			}
+
+			const failedRecipients: { jid?: string; error?: string }[] = []
+			for (const result of batched) {
+				if (
+					!result ||
+					typeof result.jid !== 'string' ||
+					(result.type !== 'pkmsg' && result.type !== 'msg') ||
+					!(result.ciphertext instanceof Uint8Array) ||
+					result.ciphertext.length === 0 ||
+					result.error
+				) {
+					failedRecipients.push({
+						jid: result?.jid,
+						error: result?.error || 'invalid-batch-encryption-result'
+					})
+					continue
+				}
+
+				encryptedItems.push({
+					jid: result.jid,
+					type: result.type,
+					ciphertext: result.ciphertext
+				})
+			}
+
+			if (failedRecipients.length > 0) {
+				throw new Boom('strict native batch encryption failed for one or more recipients', {
+					statusCode: 500,
+					data: { failedRecipients }
+				})
+			}
+		}
+
+		if (recipientJids.length > 0 && encryptedItems.length === 0) {
 			throw new Boom('All encryptions failed', { statusCode: 500 })
 		}
 
-		return { nodes, shouldIncludeDeviceIdentity }
+		const result = nativeBuildParticipantNodesBatch(encryptedItems, extraAttrs)
+		if (result && Array.isArray(result.nodes)) {
+			return {
+				nodes: result.nodes as BinaryNode[],
+				shouldIncludeDeviceIdentity: !!result.shouldIncludeDeviceIdentity
+			}
+		}
+
+		throw new Boom('native buildParticipantNodesBatch returned invalid payload', { statusCode: 500 })
 	}
 
 	const relayMessage = async (
@@ -613,13 +764,34 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			statusJidList
 		}: MessageRelayOptions
 	) => {
+		const encodedMessageCache = new WeakMap<object, Uint8Array>()
+		const encodeForRelay = (msg: proto.IMessage) => {
+			const cacheKey = msg as object
+			const cached = encodedMessageCache.get(cacheKey)
+			if (cached) {
+				return cached
+			}
+
+			const encoded = encodeWAMessage(msg)
+			encodedMessageCache.set(cacheKey, encoded)
+			return encoded
+		}
+
 		const meId = authState.creds.me!.id
 		const meLid = authState.creds.me?.lid
 		const isRetryResend = Boolean(participant?.jid)
 		let shouldIncludeDeviceIdentity = isRetryResend
 		const statusJid = 'status@broadcast'
 
-		const { user, server } = jidDecode(jid)!
+		const decodedJid = jidDecode(jid) || (jid ? jidDecode(jidNormalizedUser(jid)) : undefined)
+		if (!decodedJid) {
+			throw new Boom('invalid jid passed to relayMessage', {
+				statusCode: 400,
+				data: { jid, participant: participant?.jid, msgId }
+			})
+		}
+
+		const { user, server } = decodedJid
 		const isGroup = server === 'g.us'
 		const isStatus = jid === statusJid
 		const isLid = server === 'lid'
@@ -690,17 +862,20 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			}
 
 			if (normalizeMessageContent(message)?.pinInChatMessage || normalizeMessageContent(message)?.reactionMessage) {
-				extraAttrs['decrypt-fail'] = 'hide' // todo: expand for reactions and other types
+				extraAttrs['decrypt-fail'] = 'hide' // keep decryption-failure UX silent for metadata-only updates
 			}
 
 			if (isGroupOrStatus && !isRetryResend) {
 				const [groupData, senderKeyMap] = await Promise.all([
 					(async () => {
-						let groupData = useCachedGroupMetadata && cachedGroupMetadata ? await cachedGroupMetadata(jid) : undefined // todo: should we rely on the cache specially if the cache is outdated and the metadata has new fields?
+						let groupData =
+							(useCachedGroupMetadata && cachedGroupMetadata ? await cachedGroupMetadata(jid) : undefined) ||
+							(await groupMetadataCache.get(jid))
 						if (groupData && Array.isArray(groupData?.participants)) {
 							logger.trace({ jid, participants: groupData.participants.length }, 'using cached group metadata')
 						} else if (!isStatus) {
-							groupData = await groupMetadata(jid) // TODO: start storing group participant list + addr mode in Signal & stop relying on this
+							groupData = await groupMetadata(jid)
+							await groupMetadataCache.set(jid, groupData)
 						}
 
 						return groupData
@@ -709,13 +884,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						if (!participant && !isStatus) {
 							// what if sender memory is less accurate than the cached metadata
 							// on participant change in group, we should do sender memory manipulation
-							const result = await authState.keys.get('sender-key-memory', [jid]) // TODO: check out what if the sender key memory doesn't include the LID stuff now?
+							const result = await authState.keys.get('sender-key-memory', [jid])
 							return result[jid] || {}
 						}
 
 						return {}
 					})()
 				])
+				expandSenderKeyMapWithAlternateAddressing(senderKeyMap, groupData?.participants || [])
 
 				const participantsList = groupData ? groupData.participants.map(p => p.id) : []
 
@@ -745,7 +921,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					throw new Boom('Per-jid patching is not supported in groups')
 				}
 
-				const bytes = encodeWAMessage(patched)
+				const bytes = encodeForRelay(patched)
 				reportingMessage = patched
 				const groupAddressingMode = additionalAttributes?.['addressing_mode'] || groupData?.addressingMode || 'lid'
 				const groupSenderIdentity = groupAddressingMode === 'lid' && meLid ? meLid : meId
@@ -766,8 +942,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						!isHostedPnUser(deviceJid) &&
 						device.device !== 99
 					) {
-						//todo: revamp all this logic
-						// the goal is to follow with what I said above for each group, and instead of a true false map of ids, we can set an array full of those the app has already sent pkmsgs
+						// sender-key memory is currently tracked as a boolean map per device JID.
 						senderKeyRecipients.push(deviceJid)
 						senderKeyMap[deviceJid] = true
 					}
@@ -786,7 +961,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					const senderKeySessionTargets = senderKeyRecipients
 					await assertSessions(senderKeySessionTargets)
 
-					const result = await createParticipantNodes(senderKeyRecipients, senderKeyMsg, extraAttrs)
+					const result = await createParticipantNodes(
+						senderKeyRecipients,
+						senderKeyMsg,
+						extraAttrs,
+						undefined,
+						encodeForRelay
+					)
 					shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || result.shouldIncludeDeviceIdentity
 
 					participants.push(...result.nodes)
@@ -801,7 +982,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				await authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } })
 			} else {
 				// ADDRESSING CONSISTENCY: Match own identity to conversation context
-				// TODO: investigate if this is true
 				let ownId = meId
 				if (isLid && meLid) {
 					ownId = meLid
@@ -823,7 +1003,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					devices.push({
 						user,
 						device: 0,
-						jid: jidEncode(user, targetUserServer, 0) // rajeh, todo: this entire logic is convoluted and weird.
+						jid: jidEncode(user, targetUserServer, 0)
 					})
 
 					if (user !== ownUser) {
@@ -893,8 +1073,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					{ nodes: otherNodes, shouldIncludeDeviceIdentity: s2 }
 				] = await Promise.all([
 					// For own devices: use DSM if available (1:1 chats only)
-					createParticipantNodes(meRecipients, meMsg || message, extraAttrs),
-					createParticipantNodes(otherRecipients, message, extraAttrs, meMsg)
+					createParticipantNodes(meRecipients, meMsg || message, extraAttrs, undefined, encodeForRelay),
+					createParticipantNodes(otherRecipients, message, extraAttrs, meMsg, encodeForRelay)
 				])
 				participants.push(...meNodes)
 				participants.push(...otherNodes)
@@ -911,13 +1091,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				const isMe = areJidsSameUser(participant!.jid, isParticipantLid ? meLid : meId)
 
 				const encodedMessageToSend = isMe
-					? encodeWAMessage({
+					? encodeForRelay({
 							deviceSentMessage: {
 								destinationJid,
 								message
 							}
 						})
-					: encodeWAMessage(message)
+					: encodeForRelay(message)
 
 				const { type, ciphertext: encryptedContent } = await signalRepository.encryptMessage({
 					data: encodedMessageToSend,
@@ -996,7 +1176,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				shouldIncludeReportingToken(reportingMessage)
 			) {
 				try {
-					const encoded = encodeWAMessage(reportingMessage)
+					const encoded = encodeForRelay(reportingMessage)
 					const reportingKey: WAMessageKey = {
 						id: msgId,
 						fromMe: true,
@@ -1222,6 +1402,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				const fullMsg = await generateWAMessage(jid, content, {
 					logger,
 					userJid,
+					userLid: authState.creds.me?.lid,
 					getUrlInfo: text =>
 						getUrlInfo(text, {
 							thumbnailWidth: linkPreviewImageThumbnailWidth,
@@ -1232,8 +1413,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							logger,
 							uploadImage: generateHighQualityLinkPreview ? waUploadToServer : undefined
 						}),
-					//TODO: CACHE
-					getProfilePicUrl: sock.profilePictureUrl,
+					getProfilePicUrl: getCachedProfilePicUrl,
 					getCallLink: sock.createCallLink,
 					upload: waUploadToServer,
 					mediaCache: config.mediaCache,

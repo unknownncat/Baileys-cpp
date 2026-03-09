@@ -1,4 +1,5 @@
 import { KEY_BUNDLE_TYPE } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { SignalRepositoryWithLIDStore } from '../Types'
 import type {
 	AuthenticationCreds,
@@ -13,17 +14,15 @@ import {
 	type BinaryNode,
 	type FullJid,
 	getBinaryNodeChild,
-	getBinaryNodeChildBuffer,
 	getBinaryNodeChildren,
-	getBinaryNodeChildUInt,
-	getServerFromDomainType,
-	jidDecode,
-	S_WHATSAPP_NET,
-	WAJIDDomains
+	S_WHATSAPP_NET
 } from '../WABinary'
-import type { DeviceListData, ParsedDeviceInfo, USyncQueryResultList } from '../WAUSync'
+import type { USyncQueryResultList } from '../WAUSync'
 import { Curve, generateSignalPubKey } from './crypto'
 import { encodeBigEndian } from './generics'
+
+const nativeExtractE2ESessionBundlesFast = requireNativeExport('extractE2ESessionBundlesFast')
+const nativeExtractDeviceJidsFast = requireNativeExport('extractDeviceJidsFast')
 
 function chunk<T>(array: T[], size: number): T[][] {
 	const chunks: T[][] = []
@@ -88,17 +87,15 @@ export const xmppPreKey = (pair: KeyPair, id: number): BinaryNode => ({
 })
 
 export const parseAndInjectE2ESessions = async (node: BinaryNode, repository: SignalRepositoryWithLIDStore) => {
-	const extractKey = (key: BinaryNode) =>
-		key
-			? {
-					keyId: getBinaryNodeChildUInt(key, 'id', 3)!,
-					publicKey: generateSignalPubKey(getBinaryNodeChildBuffer(key, 'value')!),
-					signature: getBinaryNodeChildBuffer(key, 'signature')!
-				}
-			: undefined
-	const nodes = getBinaryNodeChildren(getBinaryNodeChild(node, 'list'), 'user')
-	for (const node of nodes) {
-		assertNodeErrorFree(node)
+	const userNodes = getBinaryNodeChildren(getBinaryNodeChild(node, 'list'), 'user')
+	for (const userNode of userNodes) {
+		assertNodeErrorFree(userNode)
+	}
+
+	// Extract bundles in one native pass, then inject them in chunks to avoid monopolizing the event loop.
+	const sessions = userNodes.length === 0 ? [] : nativeExtractE2ESessionBundlesFast(userNodes as unknown[])
+	if (!Array.isArray(sessions) || sessions.length !== userNodes.length) {
+		throw new Error('native extractE2ESessionBundlesFast returned invalid payload')
 	}
 
 	// Most of the work in repository.injectE2ESession is CPU intensive, not IO
@@ -107,27 +104,13 @@ export const parseAndInjectE2ESessions = async (node: BinaryNode, repository: Si
 	// This way we chunk it in smaller parts and between those parts we can yield to the event loop
 	// It's rare case when you need to E2E sessions for so many users, but it's possible
 	const chunkSize = 100
-	const chunks = chunk(nodes, chunkSize)
+	const chunks = chunk(sessions, chunkSize)
+	if (!repository.injectE2ESessions) {
+		throw new Error('strict native mode requires injectE2ESessions')
+	}
 
-	for (const nodesChunk of chunks) {
-		for (const node of nodesChunk) {
-			const signedKey = getBinaryNodeChild(node, 'skey')!
-			const key = getBinaryNodeChild(node, 'key')!
-			const identity = getBinaryNodeChildBuffer(node, 'identity')!
-			const jid = node.attrs.jid!
-
-			const registrationId = getBinaryNodeChildUInt(node, 'registration', 4)
-
-			await repository.injectE2ESession({
-				jid,
-				session: {
-					registrationId: registrationId!,
-					identityKey: generateSignalPubKey(identity),
-					signedPreKey: extractKey(signedKey)!,
-					preKey: extractKey(key)!
-				}
-			})
-		}
+	for (const sessionsChunk of chunks) {
+		await repository.injectE2ESessions(sessionsChunk)
 	}
 }
 
@@ -137,38 +120,12 @@ export const extractDeviceJids = (
 	myLid: string,
 	excludeZeroDevices: boolean
 ) => {
-	const { user: myUser, device: myDevice } = jidDecode(myJid)!
-
-	const extracted: FullJid[] = []
-
-	for (const userResult of result) {
-		const { devices, id } = userResult as { devices: ParsedDeviceInfo; id: string }
-		const decoded = jidDecode(id)!,
-			{ user, server } = decoded
-		let { domainType } = decoded
-		const deviceList = devices?.deviceList as DeviceListData[]
-		if (!Array.isArray(deviceList)) continue
-		for (const { id: device, keyIndex, isHosted } of deviceList) {
-			if (
-				(!excludeZeroDevices || device !== 0) && // if zero devices are not-excluded, or device is non zero
-				((myUser !== user && myLid !== user) || myDevice !== device) && // either different user or if me user, not this device
-				(device === 0 || !!keyIndex) // ensure that "key-index" is specified for "non-zero" devices, produces a bad req otherwise
-			) {
-				if (isHosted) {
-					domainType = domainType === WAJIDDomains.LID ? WAJIDDomains.HOSTED_LID : WAJIDDomains.HOSTED
-				}
-
-				extracted.push({
-					user,
-					device,
-					domainType,
-					server: getServerFromDomainType(server, domainType)
-				})
-			}
-		}
+	const nativeResult = nativeExtractDeviceJidsFast(result as unknown[], myJid, myLid, excludeZeroDevices)
+	if (!Array.isArray(nativeResult)) {
+		throw new Error('native extractDeviceJidsFast returned invalid payload')
 	}
 
-	return extracted
+	return nativeResult as FullJid[]
 }
 
 /**

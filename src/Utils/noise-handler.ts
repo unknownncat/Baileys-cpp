@@ -1,6 +1,7 @@
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
 import { NOISE_MODE, WA_CERT_DETAILS } from '../Defaults'
+import { type NativeFrameBuffer, requireNativeExport } from '../Native/baileys-native'
 import type { KeyPair } from '../Types'
 import type { BinaryNode } from '../WABinary'
 import { decodeBinaryNode } from '../WABinary'
@@ -10,6 +11,7 @@ import type { ILogger } from './logger'
 const IV_LENGTH = 12
 
 const EMPTY_BUFFER = Buffer.alloc(0)
+const NativeFrameBufferCtor = requireNativeExport('NativeFrameBuffer')
 
 const generateIV = (counter: number): Uint8Array => {
 	const iv = new ArrayBuffer(IV_LENGTH)
@@ -70,7 +72,7 @@ export const makeNoiseHandler = ({
 	let counter = 0
 	let sentIntro = false
 
-	let inBytes: Buffer = Buffer.alloc(0)
+	const nativeFrameBuffer: NativeFrameBuffer = new NativeFrameBufferCtor()
 
 	let transport: TransportState | null = null
 	let isWaitingForTransport = false
@@ -138,32 +140,44 @@ export const makeNoiseHandler = ({
 		logger.trace('Noise handler transitioned to Transport state')
 
 		if (pendingOnFrame) {
-			logger.trace({ length: inBytes.length }, 'Flushing buffered frames after transport ready')
-			await processData(pendingOnFrame)
+			logger.trace({ length: nativeFrameBuffer.size() }, 'Flushing buffered frames after transport ready')
+			await processDataNative(pendingOnFrame)
 			pendingOnFrame = null
 		}
 	}
 
-	const processData = async (onFrame: (buff: Uint8Array | BinaryNode) => void) => {
-		let size: number | undefined
+	const processDataNative = async (onFrame: (buff: Uint8Array | BinaryNode) => void) => {
+		if (nativeFrameBuffer.popFrame) {
+			while (true) {
+				const rawFrame = nativeFrameBuffer.popFrame()
+				if (!rawFrame) {
+					return
+				}
 
-		while (true) {
-			if (inBytes.length < 3) return
+				let frame: Uint8Array | BinaryNode = rawFrame
+				if (transport) {
+					const result = transport.decrypt(rawFrame)
+					frame = await decodeBinaryNode(result)
+				}
 
-			size = (inBytes[0]! << 16) | (inBytes[1]! << 8) | inBytes[2]!
+				if (logger.level === 'trace') {
+					logger.trace({ msg: (frame as unknown as BinaryNode)?.attrs?.id }, 'recv frame')
+				}
 
-			if (inBytes.length < size + 3) return
+				onFrame(frame)
+			}
+		}
 
-			let frame: Uint8Array | BinaryNode = inBytes.subarray(3, size + 3)
-			inBytes = inBytes.subarray(size + 3)
-
+		const frames = nativeFrameBuffer.popFrames()
+		for (const rawFrame of frames) {
+			let frame: Uint8Array | BinaryNode = rawFrame
 			if (transport) {
-				const result = transport.decrypt(frame)
+				const result = transport.decrypt(rawFrame)
 				frame = await decodeBinaryNode(result)
 			}
 
 			if (logger.level === 'trace') {
-				logger.trace({ msg: (frame as BinaryNode)?.attrs?.id }, 'recv frame')
+				logger.trace({ msg: (frame as unknown as BinaryNode)?.attrs?.id }, 'recv frame')
 			}
 
 			onFrame(frame)
@@ -251,18 +265,13 @@ export const makeNoiseHandler = ({
 		},
 		decodeFrame: async (newData: Buffer | Uint8Array, onFrame: (buff: Uint8Array | BinaryNode) => void) => {
 			if (isWaitingForTransport) {
-				inBytes = Buffer.concat([inBytes, newData])
+				nativeFrameBuffer.append(newData)
 				pendingOnFrame = onFrame
 				return
 			}
 
-			if (inBytes.length === 0) {
-				inBytes = Buffer.from(newData)
-			} else {
-				inBytes = Buffer.concat([inBytes, newData])
-			}
-
-			await processData(onFrame)
+			nativeFrameBuffer.append(newData)
+			await processDataNative(onFrame)
 		}
 	}
 }

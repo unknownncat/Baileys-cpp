@@ -1,3 +1,4 @@
+import { requireNativeExport } from '../Native/baileys-native'
 import type { USyncQueryProtocol } from '../Types/USync'
 import { type BinaryNode, getBinaryNodeChild } from '../WABinary'
 import { USyncBotProfileProtocol } from './Protocols/UsyncBotProfileProtocol'
@@ -10,11 +11,25 @@ import {
 } from './Protocols'
 import { USyncUser } from './USyncUser'
 
+const NATIVE_USYNC_PROTOCOLS = new Set(['contact', 'lid', 'devices', 'status', 'disappearing_mode', 'bot'])
+const nativeParseUSyncQueryResultFast = requireNativeExport('parseUSyncQueryResultFast')
+
 export type USyncQueryResultList = { [protocol: string]: unknown; id: string }
+
+export type USyncQueryError = {
+	code?: number
+	text?: string
+	id?: string
+	protocol?: string
+	tag?: string
+}
 
 export type USyncQueryResult = {
 	list: USyncQueryResultList[]
 	sideList: USyncQueryResultList[]
+	errors: USyncQueryError[]
+	backoffMs?: number
+	retryAfterMs?: number
 }
 
 export class USyncQuery {
@@ -50,6 +65,21 @@ export class USyncQuery {
 			return
 		}
 
+		const protocolNames = this.protocols.map(protocol => protocol.name)
+		const canUseNative = protocolNames.length > 0 && protocolNames.every(name => NATIVE_USYNC_PROTOCOLS.has(name))
+		if (canUseNative) {
+			const nativeParsed = nativeParseUSyncQueryResultFast(result as unknown, protocolNames)
+			if (!nativeParsed || !Array.isArray(nativeParsed.list) || !Array.isArray(nativeParsed.sideList)) {
+				throw new Error('native parseUSyncQueryResultFast returned invalid payload')
+			}
+
+			return {
+				list: nativeParsed.list as USyncQueryResultList[],
+				sideList: nativeParsed.sideList as USyncQueryResultList[],
+				errors: []
+			}
+		}
+
 		const protocolMap = Object.fromEntries(
 			this.protocols.map(protocol => {
 				return [protocol.name, protocol.parser]
@@ -57,47 +87,104 @@ export class USyncQuery {
 		)
 
 		const queryResult: USyncQueryResult = {
-			// TODO: implement errors etc.
 			list: [],
-			sideList: []
+			sideList: [],
+			errors: []
 		}
 
 		const usyncNode = getBinaryNodeChild(result, 'usync')
+		if (!usyncNode) {
+			return queryResult
+		}
 
-		//TODO: implement error backoff, refresh etc.
-		//TODO: see if there are any errors in the result node
-		//const resultNode = getBinaryNodeChild(usyncNode, 'result')
+		const resultNode = getBinaryNodeChild(usyncNode, 'result')
+		const usyncErrorNode = getBinaryNodeChild(usyncNode, 'error')
+		const resultErrorNode = resultNode ? getBinaryNodeChild(resultNode, 'error') : undefined
+		if (usyncErrorNode) {
+			queryResult.errors.push({
+				code: usyncErrorNode.attrs.code ? +usyncErrorNode.attrs.code : undefined,
+				text: usyncErrorNode.attrs.text,
+				tag: 'usync'
+			})
+		}
 
-		const listNode = usyncNode ? getBinaryNodeChild(usyncNode, 'list') : undefined
+		if (resultErrorNode) {
+			queryResult.errors.push({
+				code: resultErrorNode.attrs.code ? +resultErrorNode.attrs.code : undefined,
+				text: resultErrorNode.attrs.text,
+				tag: 'result'
+			})
+		}
 
-		if (listNode?.content && Array.isArray(listNode.content)) {
-			queryResult.list = listNode.content.reduce((acc: USyncQueryResultList[], node) => {
-				const id = node?.attrs.jid
-				if (id) {
-					const data = Array.isArray(node?.content)
-						? Object.fromEntries(
-								node.content
-									.map(content => {
-										const protocol = content.tag
-										const parser = protocolMap[protocol]
-										if (parser) {
-											return [protocol, parser(content)]
-										} else {
-											return [protocol, null]
-										}
-									})
-									.filter(([, b]) => b !== null) as [string, unknown][]
-							)
-						: {}
-					acc.push({ ...data, id })
+		const backoff = usyncNode.attrs.backoff || resultNode?.attrs.backoff
+		const retryAfter = usyncNode.attrs.retry_after || resultNode?.attrs.retry_after || resultNode?.attrs.refresh
+		if (backoff !== undefined) {
+			const value = +backoff
+			if (Number.isFinite(value)) {
+				queryResult.backoffMs = value
+			}
+		}
+
+		if (retryAfter !== undefined) {
+			const value = +retryAfter
+			if (Number.isFinite(value)) {
+				queryResult.retryAfterMs = value
+			}
+		}
+
+		const parseList = (listNode: BinaryNode | undefined): USyncQueryResultList[] => {
+			if (!listNode?.content || !Array.isArray(listNode.content)) {
+				return []
+			}
+
+			return listNode.content.reduce((acc: USyncQueryResultList[], node) => {
+				const id = node?.attrs?.jid
+				if (!id) {
+					return acc
 				}
 
+				const userErrorNode = getBinaryNodeChild(node, 'error')
+				if (userErrorNode) {
+					queryResult.errors.push({
+						code: userErrorNode.attrs.code ? +userErrorNode.attrs.code : undefined,
+						text: userErrorNode.attrs.text,
+						id,
+						tag: node.tag
+					})
+				}
+
+				const data = Array.isArray(node?.content)
+					? Object.fromEntries(
+							node.content
+								.map(content => {
+									const protocol = content.tag
+									const parser = protocolMap[protocol]
+									if (!parser) {
+										return [protocol, null]
+									}
+
+									try {
+										return [protocol, parser(content)]
+									} catch (error: any) {
+										queryResult.errors.push({
+											id,
+											protocol,
+											text: String(error?.message || error),
+											tag: content.tag
+										})
+										return [protocol, null]
+									}
+								})
+								.filter(([, parsed]) => parsed !== null) as [string, unknown][]
+						)
+					: {}
+				acc.push({ ...data, id })
 				return acc
 			}, [])
 		}
 
-		//TODO: implement side list
-		//const sideListNode = getBinaryNodeChild(usyncNode, 'side_list')
+		queryResult.list = parseList(getBinaryNodeChild(usyncNode, 'list'))
+		queryResult.sideList = parseList(getBinaryNodeChild(usyncNode, 'side_list'))
 		return queryResult
 	}
 

@@ -1,4 +1,5 @@
 import { proto } from '../../WAProto/index.js'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	AuthenticationCreds,
 	BaileysEventEmitter,
@@ -29,10 +30,50 @@ import {
 	jidEncode,
 	jidNormalizedUser
 } from '../WABinary'
-import { aesDecryptGCM, hmacSign } from './crypto'
 import { getKeyAuthor, toNumber } from './generics'
 import { downloadAndProcessHistorySyncNotification } from './history'
 import type { ILogger } from './logger'
+
+const nativeDecodePollVoteMessageFast = requireNativeExport('decodePollVoteMessageFast')
+const nativeDecodeEventResponseMessageFast = requireNativeExport('decodeEventResponseMessageFast')
+const nativeParseJsonStringArrayFast = requireNativeExport('parseJsonStringArrayFast')
+const nativeParseGroupParticipantStubsFast = requireNativeExport('parseGroupParticipantStubsFast')
+
+const parseJsonStringArray = <T>(values?: (string | null | undefined)[]): T[] => {
+	if (!values?.length) {
+		return []
+	}
+
+	const compact = values.filter((value): value is string => typeof value === 'string')
+	if (compact.length === 0) {
+		return []
+	}
+
+	const parsed = nativeParseJsonStringArrayFast(compact)
+	if (!Array.isArray(parsed) || parsed.length !== compact.length) {
+		throw new Error('native parseJsonStringArrayFast returned invalid payload')
+	}
+
+	return parsed as T[]
+}
+
+const parseGroupParticipantStubs = (values?: (string | null | undefined)[]): GroupParticipant[] => {
+	if (!values?.length) {
+		return []
+	}
+
+	const compact = values.filter((value): value is string => typeof value === 'string')
+	if (compact.length === 0) {
+		return []
+	}
+
+	const parsed = nativeParseGroupParticipantStubsFast(compact)
+	if (!Array.isArray(parsed) || parsed.length !== compact.length) {
+		throw new Error('native parseGroupParticipantStubsFast returned invalid payload')
+	}
+
+	return parsed as GroupParticipant[]
+}
 
 type ProcessMessageContext = {
 	shouldProcessHistoryMsg: boolean
@@ -98,8 +139,7 @@ export const cleanMessage = (message: WAMessage, meId: string, meLid: string) =>
 				: // if the message being reacted to, was from them
 					// fromMe automatically becomes false
 					false
-			// set the remoteJid to being the same as the chat the message came from
-			// TODO: investigate inconsistencies
+			// use the parent message chat so reactions/poll updates are scoped correctly
 			msgKey.remoteJid = message.key.remoteJid
 			// set participant of the message
 			msgKey.participant = msgKey.participant || message.key.participant
@@ -107,7 +147,6 @@ export const cleanMessage = (message: WAMessage, meId: string, meLid: string) =>
 	}
 }
 
-// TODO: target:audit AUDIT THIS FUNCTION AGAIN
 export const isRealMessage = (message: WAMessage) => {
 	const normalizedContent = normalizeMessageContent(message.message)
 	const hasSomeContent = !!getContentType(normalizedContent)
@@ -168,24 +207,16 @@ export function decryptPollVote(
 	{ encPayload, encIv }: proto.Message.IPollEncValue,
 	{ pollCreatorJid, pollMsgId, pollEncKey, voterJid }: PollContext
 ) {
-	const sign = Buffer.concat([
-		toBinary(pollMsgId),
-		toBinary(pollCreatorJid),
-		toBinary(voterJid),
-		toBinary('Poll Vote'),
-		new Uint8Array([1])
-	])
-
-	const key0 = hmacSign(pollEncKey, new Uint8Array(32), 'sha256')
-	const decKey = hmacSign(sign, key0, 'sha256')
-	const aad = toBinary(`${pollMsgId}\u0000${voterJid}`)
-
-	const decrypted = aesDecryptGCM(encPayload!, decKey, encIv!, aad)
-	return proto.Message.PollVoteMessage.decode(decrypted)
-
-	function toBinary(txt: string) {
-		return Buffer.from(txt)
+	if (!encPayload || !encIv) {
+		throw new Error('poll vote payload/iv is required for native decryption')
 	}
+
+	const decoded = nativeDecodePollVoteMessageFast(encPayload, encIv, pollMsgId, pollCreatorJid, voterJid, pollEncKey)
+	if (!decoded) {
+		throw new Error('native decodePollVoteMessageFast returned invalid payload')
+	}
+
+	return decoded as proto.Message.PollVoteMessage
 }
 
 /**
@@ -198,24 +229,23 @@ export function decryptEventResponse(
 	{ encPayload, encIv }: proto.Message.IPollEncValue,
 	{ eventCreatorJid, eventMsgId, eventEncKey, responderJid }: EventContext
 ) {
-	const sign = Buffer.concat([
-		toBinary(eventMsgId),
-		toBinary(eventCreatorJid),
-		toBinary(responderJid),
-		toBinary('Event Response'),
-		new Uint8Array([1])
-	])
-
-	const key0 = hmacSign(eventEncKey, new Uint8Array(32), 'sha256')
-	const decKey = hmacSign(sign, key0, 'sha256')
-	const aad = toBinary(`${eventMsgId}\u0000${responderJid}`)
-
-	const decrypted = aesDecryptGCM(encPayload!, decKey, encIv!, aad)
-	return proto.Message.EventResponseMessage.decode(decrypted)
-
-	function toBinary(txt: string) {
-		return Buffer.from(txt)
+	if (!encPayload || !encIv) {
+		throw new Error('event response payload/iv is required for native decryption')
 	}
+
+	const decoded = nativeDecodeEventResponseMessageFast(
+		encPayload,
+		encIv,
+		eventMsgId,
+		eventCreatorJid,
+		responderJid,
+		eventEncKey
+	)
+	if (!decoded) {
+		throw new Error('native decodeEventResponseMessageFast returned invalid payload')
+	}
+
+	return decoded as proto.Message.EventResponseMessage
 }
 
 const processMessage = async (
@@ -275,13 +305,20 @@ const processMessage = async (
 				)
 
 				if (process) {
-					// TODO: investigate
 					if (histNotification.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND) {
+						const alreadyProcessed = (creds.processedHistoryMessages || []).some(
+							entry =>
+								entry?.key?.id === message.key.id &&
+								areJidsSameUser(entry?.key?.remoteJid || undefined, message.key.remoteJid || undefined) &&
+								!!entry?.messageTimestamp
+						)
 						ev.emit('creds.update', {
-							processedHistoryMessages: [
-								...(creds.processedHistoryMessages || []),
-								{ key: message.key, messageTimestamp: message.messageTimestamp }
-							]
+							processedHistoryMessages: alreadyProcessed
+								? creds.processedHistoryMessages || []
+								: [
+										...(creds.processedHistoryMessages || []),
+										{ key: message.key, messageTimestamp: message.messageTimestamp }
+									]
 						})
 					}
 
@@ -346,9 +383,36 @@ const processMessage = async (
 			case proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
 				const response = protocolMsg.peerDataOperationRequestResponseMessage!
 				if (response) {
-					// TODO: IMPLEMENT HISTORY SYNC ETC (sticker uploads etc.).
 					const peerDataOperationResult = response.peerDataOperationResult || []
+					ev.emit('peer-data-operation.response', {
+						requestId: response.stanzaId || undefined,
+						requestType: response.peerDataOperationRequestType || undefined,
+						results: peerDataOperationResult
+					})
+
 					for (const result of peerDataOperationResult) {
+						// eslint-disable-next-line max-depth
+						if (result?.fullHistorySyncOnDemandRequestResponse) {
+							const status = result.fullHistorySyncOnDemandRequestResponse.responseCode
+							// eslint-disable-next-line max-depth
+							if (
+								typeof status === 'number' &&
+								status !==
+									proto.Message.PeerDataOperationRequestResponseMessage.PeerDataOperationResult
+										.FullHistorySyncOnDemandResponseCode.REQUEST_SUCCESS
+							) {
+								logger?.warn({ status, stanzaId: response.stanzaId }, 'history sync on demand request was not accepted')
+							}
+						}
+
+						// eslint-disable-next-line max-depth
+						if (result?.historySyncChunkRetryResponse && result.historySyncChunkRetryResponse.canRecover === false) {
+							logger?.warn(
+								{ response: result.historySyncChunkRetryResponse, stanzaId: response.stanzaId },
+								'history sync chunk retry reported non-recoverable state'
+							)
+						}
+
 						const retryResponse = result?.placeholderMessageResendResponse
 						//eslint-disable-next-line max-depth
 						if (!retryResponse?.webMessageInfoBytes) {
@@ -544,12 +608,12 @@ const processMessage = async (
 
 		switch (message.messageStubType) {
 			case WAMessageStubType.GROUP_PARTICIPANT_CHANGE_NUMBER:
-				participants = message.messageStubParameters.map((a: any) => JSON.parse(a as string)) || []
+				participants = parseGroupParticipantStubs(message.messageStubParameters as string[])
 				emitParticipantsUpdate('modify')
 				break
 			case WAMessageStubType.GROUP_PARTICIPANT_LEAVE:
 			case WAMessageStubType.GROUP_PARTICIPANT_REMOVE:
-				participants = message.messageStubParameters.map((a: any) => JSON.parse(a as string)) || []
+				participants = parseGroupParticipantStubs(message.messageStubParameters as string[])
 				emitParticipantsUpdate('remove')
 				// mark the chat read only if you left the group
 				if (participantsIncludesMe()) {
@@ -560,7 +624,7 @@ const processMessage = async (
 			case WAMessageStubType.GROUP_PARTICIPANT_ADD:
 			case WAMessageStubType.GROUP_PARTICIPANT_INVITE:
 			case WAMessageStubType.GROUP_PARTICIPANT_ADD_REQUEST_JOIN:
-				participants = message.messageStubParameters.map((a: any) => JSON.parse(a as string)) || []
+				participants = parseGroupParticipantStubs(message.messageStubParameters as string[])
 				if (participantsIncludesMe()) {
 					chat.readOnly = false
 				}
@@ -568,11 +632,11 @@ const processMessage = async (
 				emitParticipantsUpdate('add')
 				break
 			case WAMessageStubType.GROUP_PARTICIPANT_DEMOTE:
-				participants = message.messageStubParameters.map((a: any) => JSON.parse(a as string)) || []
+				participants = parseGroupParticipantStubs(message.messageStubParameters as string[])
 				emitParticipantsUpdate('demote')
 				break
 			case WAMessageStubType.GROUP_PARTICIPANT_PROMOTE:
-				participants = message.messageStubParameters.map((a: any) => JSON.parse(a as string)) || []
+				participants = parseGroupParticipantStubs(message.messageStubParameters as string[])
 				emitParticipantsUpdate('promote')
 				break
 			case WAMessageStubType.GROUP_CHANGE_ANNOUNCE:
@@ -605,19 +669,22 @@ const processMessage = async (
 				const approvalMode = message.messageStubParameters?.[0]
 				emitGroupUpdate({ joinApprovalMode: approvalMode === 'on' })
 				break
-			case WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_REQUEST_NON_ADMIN_ADD: // TODO: Add other events
-				const participant = JSON.parse(message.messageStubParameters?.[0]) as LIDMapping
+			case WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_REQUEST_NON_ADMIN_ADD:
+			case WAMessageStubType.GROUP_MEMBERSHIP_JOIN_APPROVAL_REQUEST:
+				const participant = parseJsonStringArray<LIDMapping>([message.messageStubParameters?.[0]])[0] as LIDMapping
+				if (!participant) {
+					throw new Error('invalid membership join participant payload')
+				}
+
 				const action = message.messageStubParameters?.[1] as RequestJoinAction
 				const method = message.messageStubParameters?.[2] as RequestJoinMethod
 				emitGroupRequestJoin(participant, action, method)
 				break
 		}
 	} /*  else if(content?.pollUpdateMessage) {
-		const creationMsgKey = content.pollUpdateMessage.pollCreationMessageKey!
-		// we need to fetch the poll creation message to get the poll enc key
-		// TODO: make standalone, remove getMessage reference
-		// TODO: Remove entirely
-		const pollMsg = await getMessage(creationMsgKey)
+			const creationMsgKey = content.pollUpdateMessage.pollCreationMessageKey!
+			// we need to fetch the poll creation message to get the poll enc key
+			const pollMsg = await getMessage(creationMsgKey)
 		if(pollMsg) {
 			const meIdNormalised = jidNormalizedUser(meId)
 			const pollCreatorJid = getKeyAuthor(creationMsgKey, meIdNormalised)

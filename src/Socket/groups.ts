@@ -7,6 +7,8 @@ import {
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
 	getBinaryNodeChildString,
+	isHostedLidUser,
+	isHostedPnUser,
 	isLidUser,
 	isPnUser,
 	jidEncode,
@@ -14,9 +16,36 @@ import {
 } from '../WABinary'
 import { makeChatsSocket } from './chats'
 
+const isLidLike = (jid: string | null | undefined): boolean =>
+	!!(isLidUser(jid || undefined) || isHostedLidUser(jid || undefined))
+const isPnLike = (jid: string | null | undefined): boolean =>
+	!!(isPnUser(jid || undefined) || isHostedPnUser(jid || undefined))
+
+const parseGroupParticipant = (attrs: BinaryNode['attrs']): GroupParticipant | undefined => {
+	const id = attrs.jid || attrs.phone_number || attrs.lid
+	if (!id) {
+		return undefined
+	}
+
+	return {
+		id,
+		phoneNumber: (isLidLike(attrs.jid) && isPnLike(attrs.phone_number) && attrs.phone_number) || undefined,
+		lid: (isPnLike(attrs.jid) && isLidLike(attrs.lid) && attrs.lid) || undefined,
+		admin: (attrs.type || null) as GroupParticipant['admin']
+	}
+}
+
+const collectLidPnMappings = (participants: GroupParticipant[]) =>
+	participants
+		.filter(participant => participant.phoneNumber && participant.lid)
+		.map(participant => ({
+			pn: participant.phoneNumber as string,
+			lid: participant.lid as string
+		}))
+
 export const makeGroupsSocket = (config: SocketConfig) => {
 	const sock = makeChatsSocket(config)
-	const { authState, ev, query, upsertMessage } = sock
+	const { authState, ev, query, upsertMessage, signalRepository } = sock
 
 	const groupQuery = async (jid: string, type: 'get' | 'set', content: BinaryNode[]) =>
 		query({
@@ -54,6 +83,7 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 			]
 		})
 		const data: { [_: string]: GroupMetadata } = {}
+		const lidPnMappings: { lid: string; pn: string }[] = []
 		const groupsChild = getBinaryNodeChild(result, 'groups')
 		if (groupsChild) {
 			const groups = getBinaryNodeChildren(groupsChild, 'group')
@@ -64,10 +94,18 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 					content: [groupNode]
 				})
 				data[meta.id] = meta
+				lidPnMappings.push(...collectLidPnMappings(meta.participants))
 			}
 		}
 
-		// TODO: properly parse LID / PN DATA
+		if (lidPnMappings.length > 0) {
+			try {
+				await signalRepository.lidMapping.storeLIDPNMappings(lidPnMappings)
+			} catch {
+				// ignore mapping storage failures for metadata fetches
+			}
+		}
+
 		sock.ev.emit('groups.update', Object.values(data))
 
 		return data
@@ -344,15 +382,9 @@ export const extractGroupMetadata = (result: BinaryNode) => {
 		isCommunityAnnounce: !!getBinaryNodeChild(group, 'default_sub_group'),
 		joinApprovalMode: !!getBinaryNodeChild(group, 'membership_approval_mode'),
 		memberAddMode,
-		participants: getBinaryNodeChildren(group, 'participant').map(({ attrs }) => {
-			// TODO: Store LID MAPPINGS
-			return {
-				id: attrs.jid!,
-				phoneNumber: isLidUser(attrs.jid) && isPnUser(attrs.phone_number) ? attrs.phone_number : undefined,
-				lid: isPnUser(attrs.jid) && isLidUser(attrs.lid) ? attrs.lid : undefined,
-				admin: (attrs.type || null) as GroupParticipant['admin']
-			}
-		}),
+		participants: getBinaryNodeChildren(group, 'participant')
+			.map(({ attrs }) => parseGroupParticipant(attrs))
+			.filter((participant): participant is GroupParticipant => !!participant),
 		ephemeralDuration: eph ? +eph : undefined
 	}
 	return metadata

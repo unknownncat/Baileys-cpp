@@ -1,6 +1,5 @@
-import { promisify } from 'util'
-import { inflate } from 'zlib'
 import { proto } from '../../WAProto/index.js'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { Chat, Contact, LIDMapping, WAMessage } from '../Types'
 import { WAMessageStubType } from '../Types'
 import { isHostedLidUser, isHostedPnUser, isLidUser, isPnUser } from '../WABinary'
@@ -9,7 +8,33 @@ import type { ILogger } from './logger.js'
 import { normalizeMessageContent } from './messages'
 import { downloadContentFromMessage } from './messages-media'
 
-const inflatePromise = promisify(inflate)
+const nativeDecodeCompressedHistorySyncRaw = requireNativeExport('decodeCompressedHistorySyncRaw')
+const NativeHistorySyncCompressedDecoderCtor = requireNativeExport('NativeHistorySyncCompressedDecoder')
+
+const decodeCompressedHistorySyncPayload = async (data: Uint8Array | Buffer): Promise<proto.HistorySync> => {
+	const decoded = nativeDecodeCompressedHistorySyncRaw(data)
+	if (!decoded) {
+		throw new Error('native decodeCompressedHistorySyncRaw returned invalid payload')
+	}
+
+	return decoded as proto.HistorySync
+}
+
+const decodeCompressedHistorySyncStream = async (
+	stream: AsyncIterable<Uint8Array | Buffer>
+): Promise<proto.HistorySync> => {
+	const decoder = new NativeHistorySyncCompressedDecoderCtor()
+	for await (const chunk of stream) {
+		decoder.append(chunk)
+	}
+
+	const decoded = decoder.decode(true)
+	if (!decoded) {
+		throw new Error('native NativeHistorySyncCompressedDecoder.decode returned invalid payload')
+	}
+
+	return decoded as proto.HistorySync
+}
 
 const extractPnFromMessages = (messages: proto.IHistorySyncMsg[]): string | undefined => {
 	for (const msgItem of messages) {
@@ -31,18 +56,11 @@ const extractPnFromMessages = (messages: proto.IHistorySyncMsg[]): string | unde
 
 export const downloadHistory = async (msg: proto.Message.IHistorySyncNotification, options: RequestInit) => {
 	const stream = await downloadContentFromMessage(msg, 'md-msg-hist', { options })
-	const bufferArray: Buffer[] = []
-	for await (const chunk of stream) {
-		bufferArray.push(chunk)
+	try {
+		return await decodeCompressedHistorySyncStream(stream)
+	} finally {
+		stream.destroy()
 	}
-
-	let buffer: Buffer = Buffer.concat(bufferArray)
-
-	// decompress buffer
-	buffer = await inflatePromise(buffer)
-
-	const syncData = proto.HistorySync.decode(buffer)
-	return syncData
 }
 
 export const processHistoryMessage = (item: proto.IHistorySync, logger?: ILogger) => {
@@ -145,7 +163,7 @@ export const downloadAndProcessHistorySyncNotification = async (
 ) => {
 	let historyMsg: proto.HistorySync
 	if (msg.initialHistBootstrapInlinePayload) {
-		historyMsg = proto.HistorySync.decode(await inflatePromise(msg.initialHistBootstrapInlinePayload))
+		historyMsg = await decodeCompressedHistorySyncPayload(msg.initialHistBootstrapInlinePayload)
 	} else {
 		historyMsg = await downloadHistory(msg, options)
 	}

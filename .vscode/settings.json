@@ -1,0 +1,29 @@
+{
+	"C_Cpp.errorSquiggles": "enabled",
+	"C_Cpp.intelliSenseEngine": "default",
+	"C_Cpp.default.cppStandard": "c++20",
+	"C_Cpp.default.cStandard": "c17",
+	"C_Cpp.default.defines": [
+		"NAPI_DISABLE_CPP_EXCEPTIONS",
+		"NODE_ADDON_API_DISABLE_DEPRECATED"
+	],
+	"C_Cpp.default.includePath": [
+		"${workspaceFolder}/native",
+		"${workspaceFolder}/native/generated",
+		"${workspaceFolder}/node_modules/node-addon-api",
+		"${workspaceFolder}/node_modules/node-addon-api/src",
+		"${workspaceFolder}/node_modules/@types/node"
+	],
+	"files.associations": {
+		"*.tcc": "cpp",
+		"*.ipp": "cpp"
+	},
+	"files.exclude": {
+		"build": true,
+		"lib": true
+	},
+	"[cpp]": {
+		"editor.defaultFormatter": "ms-vscode.cpptools",
+		"editor.formatOnSave": true
+	}
+}

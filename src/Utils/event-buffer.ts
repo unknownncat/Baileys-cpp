@@ -1,4 +1,5 @@
 import EventEmitter from 'events'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	BaileysEvent,
 	BaileysEventEmitter,
@@ -43,6 +44,9 @@ type BufferableEvent = (typeof BUFFERABLE_EVENT)[number]
 type BaileysEventData = Partial<BaileysEventMap>
 
 const BUFFERABLE_EVENT_SET = new Set<BaileysEvent>(BUFFERABLE_EVENT)
+const nativeStringifyMessageKeysFast = requireNativeExport('stringifyMessageKeysFast')
+const nativeStringifyMessageKeysFromMessagesFast = requireNativeExport('stringifyMessageKeysFromMessagesFast')
+const nativeStringifyMessageKeysFromEntriesFast = requireNativeExport('stringifyMessageKeysFromEntriesFast')
 
 type BaileysBufferableEventEmitter = BaileysEventEmitter & {
 	/** Use to process events in a batch */
@@ -191,6 +195,11 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 				}
 			}
 
+			if (isBuffering && event === 'messages.delete' && 'all' in (evData as BaileysEventMap['messages.delete'])) {
+				flush()
+				return ev.emit('event', { [event]: evData })
+			}
+
 			if (isBuffering && BUFFERABLE_EVENT_SET.has(event)) {
 				append(data, historyCache, event as BufferableEvent, evData, logger)
 				return true
@@ -299,8 +308,11 @@ function append<E extends BufferableEvent>(
 				}
 			}
 
-			for (const message of eventData.messages as WAMessage[]) {
-				const key = stringifyMessageKey(message.key)
+			const historyMessages = eventData.messages as WAMessage[]
+			const historyMessageKeys = stringifyMessageKeysFromMessagesBatch(historyMessages)
+			for (let i = 0; i < historyMessages.length; i += 1) {
+				const message = historyMessages[i]!
+				const key = historyMessageKeys[i]!
 				const existingMsg = data.historySets.messages[key]
 				if (!existingMsg && !historyCache.has(key)) {
 					data.historySets.messages[key] = message
@@ -434,8 +446,10 @@ function append<E extends BufferableEvent>(
 			break
 		case 'messages.upsert':
 			const { messages, type } = eventData as BaileysEventMap['messages.upsert']
-			for (const message of messages) {
-				const key = stringifyMessageKey(message.key)
+			const upsertMessageKeys = stringifyMessageKeysFromMessagesBatch(messages)
+			for (let i = 0; i < messages.length; i += 1) {
+				const message = messages[i]!
+				const key = upsertMessageKeys[i]!
 				let existing = data.messageUpserts[key]?.message
 				if (!existing) {
 					existing = data.historySets.messages[key]
@@ -467,8 +481,10 @@ function append<E extends BufferableEvent>(
 			break
 		case 'messages.update':
 			const msgUpdates = eventData as BaileysEventMap['messages.update']
-			for (const { key, update } of msgUpdates) {
-				const keyStr = stringifyMessageKey(key)
+			const messageUpdateKeys = stringifyMessageKeysFromEntriesBatch(msgUpdates)
+			for (let i = 0; i < msgUpdates.length; i += 1) {
+				const { key, update } = msgUpdates[i]!
+				const keyStr = messageUpdateKeys[i]!
 				const existing = data.historySets.messages[keyStr] || data.messageUpserts[keyStr]?.message
 				if (existing) {
 					Object.assign(existing, update)
@@ -490,8 +506,10 @@ function append<E extends BufferableEvent>(
 			const deleteData = eventData as BaileysEventMap['messages.delete']
 			if ('keys' in deleteData) {
 				const { keys } = deleteData
-				for (const key of keys) {
-					const keyStr = stringifyMessageKey(key)
+				const deleteMessageKeys = stringifyMessageKeysBatch(keys)
+				for (let i = 0; i < keys.length; i += 1) {
+					const key = keys[i]!
+					const keyStr = deleteMessageKeys[i]!
 					if (!data.messageDeletes[keyStr]) {
 						data.messageDeletes[keyStr] = key
 					}
@@ -505,14 +523,51 @@ function append<E extends BufferableEvent>(
 					}
 				}
 			} else {
-				// TODO: add support
+				const jidPrefix = `${deleteData.jid},`
+				for (const key of Object.keys(data.historySets.messages)) {
+					if (key.startsWith(jidPrefix)) {
+						delete data.historySets.messages[key]
+					}
+				}
+
+				for (const key of Object.keys(data.messageUpserts)) {
+					if (key.startsWith(jidPrefix)) {
+						delete data.messageUpserts[key]
+					}
+				}
+
+				for (const key of Object.keys(data.messageUpdates)) {
+					if (key.startsWith(jidPrefix)) {
+						delete data.messageUpdates[key]
+					}
+				}
+
+				for (const key of Object.keys(data.messageDeletes)) {
+					if (key.startsWith(jidPrefix)) {
+						delete data.messageDeletes[key]
+					}
+				}
+
+				for (const key of Object.keys(data.messageReactions)) {
+					if (key.startsWith(jidPrefix)) {
+						delete data.messageReactions[key]
+					}
+				}
+
+				for (const key of Object.keys(data.messageReceipts)) {
+					if (key.startsWith(jidPrefix)) {
+						delete data.messageReceipts[key]
+					}
+				}
 			}
 
 			break
 		case 'messages.reaction':
 			const reactions = eventData as BaileysEventMap['messages.reaction']
-			for (const { key, reaction } of reactions) {
-				const keyStr = stringifyMessageKey(key)
+			const reactionMessageKeys = stringifyMessageKeysFromEntriesBatch(reactions)
+			for (let i = 0; i < reactions.length; i += 1) {
+				const { key, reaction } = reactions[i]!
+				const keyStr = reactionMessageKeys[i]!
 				const existing = data.messageUpserts[keyStr]
 				if (existing) {
 					updateMessageWithReaction(existing.message, reaction)
@@ -525,8 +580,10 @@ function append<E extends BufferableEvent>(
 			break
 		case 'message-receipt.update':
 			const receipts = eventData as BaileysEventMap['message-receipt.update']
-			for (const { key, receipt } of receipts) {
-				const keyStr = stringifyMessageKey(key)
+			const receiptMessageKeys = stringifyMessageKeysFromEntriesBatch(receipts)
+			for (let i = 0; i < receipts.length; i += 1) {
+				const { key, receipt } = receipts[i]!
+				const keyStr = receiptMessageKeys[i]!
 				const existing = data.messageUpserts[keyStr]
 				if (existing) {
 					updateMessageWithReceipt(existing.message, receipt)
@@ -638,16 +695,24 @@ function consolidateEvents(data: BufferedEventData) {
 		map['messages.delete'] = { keys: messageDeleteList }
 	}
 
-	const messageReactionList = Object.values(data.messageReactions).flatMap(({ key, reactions }) =>
-		reactions.flatMap(reaction => ({ key, reaction }))
-	)
+	const messageReactionList: BaileysEventMap['messages.reaction'] = []
+	for (const { key, reactions } of Object.values(data.messageReactions)) {
+		for (const reaction of reactions) {
+			messageReactionList.push({ key, reaction })
+		}
+	}
+
 	if (messageReactionList.length) {
 		map['messages.reaction'] = messageReactionList
 	}
 
-	const messageReceiptList = Object.values(data.messageReceipts).flatMap(({ key, userReceipt }) =>
-		userReceipt.flatMap(receipt => ({ key, receipt }))
-	)
+	const messageReceiptList: BaileysEventMap['message-receipt.update'] = []
+	for (const { key, userReceipt } of Object.values(data.messageReceipts)) {
+		for (const receipt of userReceipt) {
+			messageReceiptList.push({ key, receipt })
+		}
+	}
+
 	if (messageReceiptList.length) {
 		map['message-receipt.update'] = messageReceiptList
 	}
@@ -689,4 +754,41 @@ function concatChats<C extends Partial<Chat>>(a: C, b: Partial<Chat>) {
 	return Object.assign(a, b)
 }
 
-const stringifyMessageKey = (key: WAMessageKey) => `${key.remoteJid},${key.id},${key.fromMe ? '1' : '0'}`
+const stringifyMessageKeysBatch = (keys: readonly WAMessageKey[]): string[] => {
+	if (keys.length === 0) {
+		return []
+	}
+
+	const fast = nativeStringifyMessageKeysFast(keys as unknown as unknown[])
+	if (Array.isArray(fast) && fast.length === keys.length && fast.every(key => typeof key === 'string')) {
+		return fast
+	}
+
+	throw new Error('native stringifyMessageKeysFast returned invalid payload')
+}
+
+const stringifyMessageKeysFromMessagesBatch = (messages: readonly WAMessage[]): string[] => {
+	if (messages.length === 0) {
+		return []
+	}
+
+	const fast = nativeStringifyMessageKeysFromMessagesFast(messages as unknown as unknown[])
+	if (Array.isArray(fast) && fast.length === messages.length && fast.every(key => typeof key === 'string')) {
+		return fast
+	}
+
+	throw new Error('native stringifyMessageKeysFromMessagesFast returned invalid payload')
+}
+
+const stringifyMessageKeysFromEntriesBatch = (entries: readonly { key: WAMessageKey }[]): string[] => {
+	if (entries.length === 0) {
+		return []
+	}
+
+	const fast = nativeStringifyMessageKeysFromEntriesFast(entries as unknown as unknown[])
+	if (Array.isArray(fast) && fast.length === entries.length && fast.every(key => typeof key === 'string')) {
+		return fast
+	}
+
+	throw new Error('native stringifyMessageKeysFromEntriesFast returned invalid payload')
+}

@@ -1,0 +1,65 @@
+name: Native Validation
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  native-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      BAILEYS_VCPKG_ROOT: C:\vcpkg
+      BAILEYS_VCPKG_TRIPLET: x64-windows-static
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js and Corepack
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20.x
+
+      - name: Enable Corepack and Set Yarn Version
+        shell: pwsh
+        run: |
+          corepack enable
+          corepack prepare yarn@4.x --activate
+
+      - name: Restore Yarn Cache
+        uses: actions/cache@v3
+        with:
+          path: .yarn/cache
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Install dependencies
+        shell: pwsh
+        run: yarn install --immutable
+
+      - name: Ensure vcpkg protobuf toolchain
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:BAILEYS_VCPKG_ROOT
+          $vcpkgExe = Join-Path $vcpkgRoot 'vcpkg.exe'
+          if (-not (Test-Path $vcpkgExe)) {
+            git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+            & (Join-Path $vcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
+          }
+          & $vcpkgExe install "protobuf:$env:BAILEYS_VCPKG_TRIPLET"
+
+      - name: Build native addon
+        shell: pwsh
+        run: yarn build:native
+
+      - name: Run native regression suite
+        shell: pwsh
+        run: yarn test:native
+
+      - name: Run native benchmark suite
+        shell: pwsh
+        run: yarn benchmark:native

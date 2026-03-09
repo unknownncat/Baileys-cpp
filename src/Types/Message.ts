@@ -13,6 +13,7 @@ export type WAMessage = proto.IWebMessageInfo & {
 	messageStubParameters?: any
 	category?: string
 	retryCount?: number
+	isViewOnce?: boolean
 }
 export type WAMessageContent = proto.IMessage
 export type WAContactMessage = proto.Message.IContactMessage
@@ -22,7 +23,6 @@ export type WAMessageKey = proto.IMessageKey & {
 	participantAlt?: string
 	server_id?: string
 	addressingMode?: string
-	isViewOnce?: boolean // TODO: remove out of the message key, place in WebMessageInfo
 }
 export type WATextMessage = proto.Message.IExtendedTextMessage
 export type WAContextInfo = proto.IContextInfo
@@ -95,7 +95,7 @@ export type MessageReceiptType =
 export type MediaConnInfo = {
 	auth: string
 	ttl: number
-	hosts: { hostname: string; maxContentLengthBytes: number }[]
+	hosts: { hostname: string; maxContentLengthBytes: number; attrs?: { [_: string]: string | undefined } }[]
 	fetchDate: Date
 }
 
@@ -326,6 +326,7 @@ export type MiscMessageGenerationOptions = MinimalRelayOptions & {
 }
 export type MessageGenerationOptionsFromContent = MiscMessageGenerationOptions & {
 	userJid: string
+	userLid?: string
 }
 
 export type WAMediaUploadFunction = (

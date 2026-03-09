@@ -4,6 +4,7 @@ import { Mutex } from 'async-mutex'
 import { randomBytes } from 'crypto'
 import PQueue from 'p-queue'
 import { DEFAULT_CACHE_TTLS } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type {
 	AuthenticationCreds,
 	CacheStore,
@@ -17,6 +18,17 @@ import { Curve, signedKeyPair } from './crypto'
 import { delay, generateRegistrationId } from './generics'
 import type { ILogger } from './logger'
 import { PreKeyManager } from './pre-key-manager'
+
+const nativeIsRecoverableSignalTxErrorFast = requireNativeExport('isRecoverableSignalTxErrorFast')
+
+// Expected libsignal races should roll back quietly; everything else still surfaces as an error log.
+const isRecoverableSignalTransactionError = (error: any): boolean => {
+	const errorName = String(error?.name || error?.type || '').toLowerCase()
+	const errorMessage = String(error?.message || error || '').toLowerCase()
+	const statusCode = Number(error?.output?.statusCode || error?.statusCode || 0)
+
+	return nativeIsRecoverableSignalTxErrorFast(errorName, errorMessage, Number.isFinite(statusCode) ? statusCode : 0)
+}
 
 /**
  * Transaction context stored in AsyncLocalStorage
@@ -332,7 +344,12 @@ export const addTransactionCapability = (
 
 						return result
 					} catch (error) {
-						logger.error({ error }, 'transaction failed, rolling back')
+						if (isRecoverableSignalTransactionError(error)) {
+							logger.debug({ error }, 'transaction rolled back due to recoverable signal error')
+						} else {
+							logger.error({ error }, 'transaction failed, rolling back')
+						}
+
 						throw error
 					}
 				})

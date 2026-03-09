@@ -1,8 +1,24 @@
-import { decrypt, encrypt } from 'libsignal/src/crypto'
+import { crypto } from 'libsignal'
+const { decrypt, encrypt } = crypto
 import { SenderKeyMessage } from './sender-key-message'
 import { SenderKeyName } from './sender-key-name'
 import { SenderKeyRecord } from './sender-key-record'
 import { SenderKeyState } from './sender-key-state'
+
+// A typed error lets the receive pipeline distinguish missing sender-key state from hard corruption.
+export class MissingSenderKeySessionError extends Error {
+	readonly senderKeyName: string
+	readonly senderKeyId: number
+	readonly senderKeyIteration: number
+
+	constructor(opts: { senderKeyName: string; senderKeyId: number; senderKeyIteration: number }) {
+		super('No session found to decrypt message')
+		this.name = 'MissingSenderKeySessionError'
+		this.senderKeyName = opts.senderKeyName
+		this.senderKeyId = opts.senderKeyId
+		this.senderKeyIteration = opts.senderKeyIteration
+	}
+}
 
 export interface SenderKeyStore {
 	loadSenderKey(senderKeyName: SenderKeyName): Promise<SenderKeyRecord>
@@ -55,7 +71,11 @@ export class GroupCipher {
 		const senderKeyMessage = new SenderKeyMessage(null, null, null, null, senderKeyMessageBytes)
 		const senderKeyState = record.getSenderKeyState(senderKeyMessage.getKeyId())
 		if (!senderKeyState) {
-			throw new Error('No session found to decrypt message')
+			throw new MissingSenderKeySessionError({
+				senderKeyName: this.senderKeyName.toString(),
+				senderKeyId: senderKeyMessage.getKeyId(),
+				senderKeyIteration: senderKeyMessage.getIteration()
+			})
 		}
 
 		senderKeyMessage.verifySignature(senderKeyState.getSigningKeyPublic())
@@ -107,7 +127,7 @@ export class GroupCipher {
 		}
 	}
 
-	private async getCipherText(iv: Uint8Array, key: Uint8Array, plaintext: Uint8Array): Promise<Buffer> {
+	private async getCipherText(iv: Uint8Array, key: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
 		try {
 			return encrypt(key, plaintext, iv)
 		} catch (e) {

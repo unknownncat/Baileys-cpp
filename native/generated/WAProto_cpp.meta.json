@@ -1,0 +1,8 @@
+{
+  "sourceHash": "9f30389b5e17d5f0cafc090a8e7852874defef359ef01ff187e9c6be6a5c4dd1",
+  "protocVersion": "libprotoc 33.4",
+  "sourceProtoSha256": "4bab5324186daf8de5ab592548ee80dfc753651667fa9411e0666837f90e4c8d",
+  "patchedProtoSha256": "60e0f6159d3a6fb87f81980b250e276c2d6daa51d686cfab99bf10961904bc2c",
+  "generatedHeaderSha256": "7410b4582b0619661c1c25c194cfe5b7be9df17fb6ac80bbbadd7d99ce6b3175",
+  "generatedSourceSha256": "c8e90e28cfb4cc61b4c121fab54d4dfc434ee280f98f5a31eb12fb6b05adfaa7"
+}

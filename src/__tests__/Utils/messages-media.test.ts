@@ -1,9 +1,17 @@
+import { createHash } from 'crypto'
 import * as fs from 'fs'
 import * as http from 'http'
 import * as os from 'os'
 import * as path from 'path'
 import { Readable } from 'stream'
-import { encryptedStream, type UploadParams, uploadWithNodeHttp } from '../../Utils/messages-media'
+import {
+	downloadEncryptedContent,
+	encryptedStream,
+	getMediaKeys,
+	getRawMediaUploadData,
+	type UploadParams,
+	uploadWithNodeHttp
+} from '../../Utils/messages-media'
 
 const createTempFile = async (content: string): Promise<string> => {
 	const filePath = path.join(os.tmpdir(), `test-upload-${Date.now()}.txt`)
@@ -15,6 +23,15 @@ const cleanupTempFile = async (filePath: string): Promise<void> => {
 	try {
 		await fs.promises.unlink(filePath)
 	} catch {}
+}
+
+const readStreamToBuffer = async (stream: Readable) => {
+	const chunks: Buffer[] = []
+	for await (const chunk of stream) {
+		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+	}
+
+	return Buffer.concat(chunks)
 }
 
 describe('uploadWithNodeHttp', () => {
@@ -400,6 +417,91 @@ describe('encryptedStream', () => {
 			expect(result).toBeDefined()
 			expect(result.mediaKey).toBeDefined()
 			await cleanupFiles([result.encFilePath, result.originalFilePath])
+		}
+	})
+})
+
+describe('getRawMediaUploadData', () => {
+	it('should spool the raw payload and compute the same SHA256 as Node crypto', async () => {
+		const payload = Buffer.from('raw upload payload for native spool writer parity')
+		const result = await getRawMediaUploadData(payload, 'image')
+
+		const written = await fs.promises.readFile(result.filePath)
+		expect(written).toEqual(payload)
+		expect(result.fileLength).toBe(payload.length)
+		expect(result.fileSha256).toEqual(createHash('sha256').update(payload).digest())
+
+		await cleanupTempFile(result.filePath)
+	})
+})
+
+describe('downloadEncryptedContent', () => {
+	let server: http.Server
+	let serverPort: number
+
+	afterEach(done => {
+		if (server) {
+			server.close(done)
+		} else {
+			done()
+		}
+	})
+
+	const startServer = (handler: http.RequestListener): Promise<number> =>
+		new Promise(resolve => {
+			server = http.createServer(handler)
+			server.listen(0, () => {
+				const address = server.address()
+				if (address && typeof address === 'object') {
+					serverPort = address.port
+					resolve(serverPort)
+				}
+			})
+		})
+
+	it('should decrypt only the requested byte range', async () => {
+		const payload = Buffer.from(
+			'0123456789abcdef'.repeat(16),
+			'utf8'
+		)
+		const encrypted = await encryptedStream(payload, 'image')
+		const encryptedWithMac = await fs.promises.readFile(encrypted.encFilePath)
+		const encryptedBytes = encryptedWithMac.subarray(0, encryptedWithMac.length - 10)
+
+		await startServer((req, res) => {
+			const rangeHeader = req.headers.range
+			if (!rangeHeader) {
+				res.writeHead(200, { 'Content-Length': encryptedBytes.length })
+				res.end(encryptedBytes)
+				return
+			}
+
+			const match = /^bytes=(\d+)-(\d*)$/.exec(rangeHeader)
+			const start = match ? Number(match[1]) : 0
+			const endInclusive = match?.[2] ? Number(match[2]) : encryptedBytes.length - 1
+			const body = encryptedBytes.subarray(start, endInclusive + 1)
+
+			res.writeHead(206, {
+				'Content-Length': body.length,
+				'Content-Range': `bytes ${start}-${endInclusive}/${encryptedBytes.length}`
+			})
+			res.end(body)
+		})
+
+		const keys = await getMediaKeys(encrypted.mediaKey, 'image')
+		const startByte = 19
+		const endByte = 87
+		const decryptedStream = await downloadEncryptedContent(`http://localhost:${serverPort}/media`, keys, {
+			startByte,
+			endByte
+		})
+		const decrypted = await readStreamToBuffer(decryptedStream)
+
+		expect(decrypted).toEqual(payload.subarray(startByte, endByte))
+
+		await cleanupTempFile(encrypted.encFilePath)
+		if (encrypted.originalFilePath) {
+			await cleanupTempFile(encrypted.originalFilePath)
 		}
 	})
 })

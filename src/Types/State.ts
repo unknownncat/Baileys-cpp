@@ -1,4 +1,3 @@
-import { Boom } from '@hapi/boom'
 import type { Contact } from './Contact'
 
 export enum SyncState {
@@ -14,14 +13,21 @@ export enum SyncState {
 
 export type WAConnectionState = 'open' | 'connecting' | 'close'
 
+export type DisconnectError = Error & {
+	output?: {
+		statusCode?: number
+		payload?: unknown
+	}
+	data?: unknown
+}
+
 export type ConnectionState = {
 	/** connection is now open, connecting or closed */
 	connection: WAConnectionState
 
 	/** the error that caused the connection to close */
 	lastDisconnect?: {
-		// TODO: refactor and gain independence from Boom
-		error: Boom | Error | undefined
+		error: DisconnectError | undefined
 		date: Date
 	}
 	/** is this a new login */

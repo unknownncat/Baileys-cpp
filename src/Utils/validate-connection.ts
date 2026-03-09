@@ -7,11 +7,14 @@ import {
 	WA_ADV_DEVICE_SIG_PREFIX,
 	WA_ADV_HOSTED_ACCOUNT_SIG_PREFIX
 } from '../Defaults'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { AuthenticationCreds, SignalCreds, SocketConfig } from '../Types'
-import { type BinaryNode, getBinaryNodeChild, jidDecode, S_WHATSAPP_NET } from '../WABinary'
+import { type BinaryNode, getBinaryNodeChild, S_WHATSAPP_NET } from '../WABinary'
 import { Curve, hmacSign } from './crypto'
 import { encodeBigEndian } from './generics'
 import { createSignalIdentity } from './signal'
+
+const nativeDecodeJidFast = requireNativeExport('decodeJidFast')
 
 const getUserAgent = (config: SocketConfig): proto.ClientPayload.IUserAgent => {
 	return {
@@ -64,15 +67,21 @@ const getClientPayload = (config: SocketConfig) => {
 }
 
 export const generateLoginNode = (userJid: string, config: SocketConfig): proto.IClientPayload => {
-	const { user, device } = jidDecode(userJid)!
+	const decoded = nativeDecodeJidFast(userJid)
+	if (!decoded?.user) {
+		throw new Boom('invalid login jid for client payload', { data: { userJid } })
+	}
+
+	const user = decoded.user
+	const device = typeof decoded.device === 'number' ? decoded.device : 0
+	const lidDbMigrated = Boolean(config.auth?.creds?.me?.lid || config.auth?.creds?.additionalData?.lidDbMigrated)
 	const payload: proto.IClientPayload = {
 		...getClientPayload(config),
 		passive: true,
 		pull: true,
 		username: +user,
 		device: device,
-		// TODO: investigate (hard set as false atm)
-		lidDbMigrated: false
+		lidDbMigrated
 	}
 	return proto.ClientPayload.fromObject(payload)
 }

@@ -1,5 +1,6 @@
 import { LRUCache } from 'lru-cache'
 import type { proto } from '../../WAProto/index.js'
+import { requireNativeExport } from '../Native/baileys-native'
 import type { ILogger } from './logger'
 
 /** Number of sent messages to cache in memory for handling retry receipts */
@@ -61,6 +62,10 @@ export enum RetryReason {
 
 /** Error codes that indicate a MAC failure and require immediate session recreation */
 const MAC_ERROR_CODES = new Set([RetryReason.SignalErrorInvalidMessage, RetryReason.SignalErrorBadMac])
+const PREKEY_ERROR_CODES = new Set([RetryReason.SignalErrorInvalidKey, RetryReason.SignalErrorInvalidKeyId])
+const nativeBuildRetryMessageKeyFast = requireNativeExport('buildRetryMessageKeyFast')
+const nativeParseRetryErrorCodeFast = requireNativeExport('parseRetryErrorCodeFast')
+const nativeIsMacRetryErrorCodeFast = requireNativeExport('isMacRetryErrorCodeFast')
 
 export class MessageRetryManager {
 	private recentMessagesMap = new LRUCache<string, RecentMessage>({
@@ -85,6 +90,11 @@ export class MessageRetryManager {
 		ttlAutopurge: true,
 		updateAgeOnGet: true
 	}) // 15 minutes TTL
+	// Keeps hard-failed messages blocked even after cleanup so bad sessions do not loop forever.
+	private terminalRetryFailures = new LRUCache<string, true>({
+		ttl: 15 * 60 * 1000,
+		ttlAutopurge: true
+	})
 	private pendingPhoneRequests: PendingPhoneRequest = {}
 	private readonly maxMsgRetryCount: number = 5
 	private statistics: RetryStatistics = {
@@ -148,6 +158,20 @@ export class MessageRetryManager {
 			}
 		}
 
+		// Pre-key ID mismatches generally indicate stale PN/LID session state and need explicit recreation.
+		if (errorCode !== undefined && PREKEY_ERROR_CODES.has(errorCode)) {
+			this.sessionRecreateHistory.set(jid, Date.now())
+			this.statistics.sessionRecreations++
+			this.logger.warn(
+				{ jid, errorCode: RetryReason[errorCode] },
+				'PreKey mismatch detected, forcing session recreation'
+			)
+			return {
+				reason: `pre-key mismatch (code ${errorCode}: ${RetryReason[errorCode]}), forcing session recreation`,
+				recreate: true
+			}
+		}
+
 		// IMMEDIATE recreation for MAC errors - session is definitely out of sync
 		if (errorCode !== undefined && MAC_ERROR_CODES.has(errorCode)) {
 			this.sessionRecreateHistory.set(jid, Date.now())
@@ -183,28 +207,23 @@ export class MessageRetryManager {
 	 * Returns undefined if no error code is present.
 	 */
 	parseRetryErrorCode(errorAttr: string | undefined): RetryReason | undefined {
-		if (errorAttr === undefined || errorAttr === '') {
+		const parsed = nativeParseRetryErrorCodeFast(errorAttr, RetryReason.StatusRevokeDelay)
+		if (parsed === null || parsed === undefined) {
 			return undefined
 		}
 
-		const code = parseInt(errorAttr, 10)
-		if (Number.isNaN(code)) {
-			return undefined
+		if (typeof parsed !== 'number' || !Number.isFinite(parsed)) {
+			throw new Error('native parseRetryErrorCodeFast returned invalid payload')
 		}
 
-		// Validate it's a known RetryReason
-		if (code >= RetryReason.UnknownError && code <= RetryReason.StatusRevokeDelay) {
-			return code as RetryReason
-		}
-
-		return RetryReason.UnknownError
+		return parsed as RetryReason
 	}
 
 	/**
 	 * Check if an error code indicates a MAC failure
 	 */
 	isMacError(errorCode: RetryReason | undefined): boolean {
-		return errorCode !== undefined && MAC_ERROR_CODES.has(errorCode)
+		return typeof errorCode === 'number' && nativeIsMacRetryErrorCodeFast(errorCode)
 	}
 
 	/**
@@ -223,6 +242,10 @@ export class MessageRetryManager {
 		return this.retryCounters.get(messageId) || 0
 	}
 
+	isRetryBlocked(messageId: string): boolean {
+		return this.terminalRetryFailures.has(messageId)
+	}
+
 	/**
 	 * Check if message has exceeded maximum retry attempts
 	 */
@@ -237,6 +260,7 @@ export class MessageRetryManager {
 		this.statistics.successfulRetries++
 		// Clean up retry counter for successful message
 		this.retryCounters.delete(messageId)
+		this.terminalRetryFailures.delete(messageId)
 		this.cancelPendingPhoneRequest(messageId)
 		this.removeRecentMessage(messageId)
 	}
@@ -244,9 +268,14 @@ export class MessageRetryManager {
 	/**
 	 * Mark retry as failed
 	 */
-	markRetryFailed(messageId: string): void {
+	markRetryFailed(messageId: string, terminal = false): void {
 		this.statistics.failedRetries++
 		this.retryCounters.delete(messageId)
+		if (terminal) {
+			this.terminalRetryFailures.set(messageId, true)
+		} else {
+			this.terminalRetryFailures.delete(messageId)
+		}
 		this.cancelPendingPhoneRequest(messageId)
 		this.removeRecentMessage(messageId)
 	}
@@ -280,7 +309,7 @@ export class MessageRetryManager {
 	}
 
 	private keyToString(key: RecentMessageKey): string {
-		return `${key.to}${MESSAGE_KEY_SEPARATOR}${key.id}`
+		return nativeBuildRetryMessageKeyFast(key.to, key.id, MESSAGE_KEY_SEPARATOR)
 	}
 
 	private removeRecentMessage(messageId: string): void {

@@ -1,29 +1,45 @@
 ---
 name: Bug report
-about: Create a report to help improve the library
+about: Report a reproducible defect in this fork
 title: "[BUG]"
 labels: bug
-assignees: ''
-
+assignees: ""
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+## Summary
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Created a new connection
-2. Closed & used saved credentials to log back in
-3. Etc.
+Describe the bug clearly and factually.
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+## Reproduction
 
-**Environment (please complete the following information):**
- - Is this on a server?
- - What do your `connectOptions` look like? 
- - Do you have multiple clients on the same IP?
- - Are you using a proxy?
+1. Provide the smallest reproducible setup.
+2. Include the exact commands you ran.
+3. Include the expected result.
+4. Include the actual result.
 
-**Additional context**
-Add any other context about the problem here.
+## Environment
+
+- Repository source checkout or published package:
+- Fork commit / branch:
+- Node.js version:
+- Package manager and version:
+- Operating system:
+- Native addon built (`yarn build:native`): yes / no
+- If Windows native build was involved, did you use vcpkg protobuf: yes / no
+
+## Relevant Configuration
+
+- Auth-state helper in use:
+- Custom socket options:
+- Proxy, container, or CI runner involved:
+- Environment variables related to native execution:
+
+## Logs and Diagnostics
+
+Paste only the relevant logs, stack traces, or benchmark output.
+
+Do not include credentials, auth-state files, personal phone numbers, session secrets, or other sensitive data.
+
+## Additional Context
+
+Include anything else that helps explain the failure, including whether the issue appears fork-specific or likely inherited from upstream.

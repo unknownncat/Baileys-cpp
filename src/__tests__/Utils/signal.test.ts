@@ -5,11 +5,10 @@ import type { BinaryNode } from '../../WABinary/types'
 
 describe('parseAndInjectE2ESessions', () => {
 	it('should process all user node', async () => {
+		const injectE2ESessions = jest.fn(async () => undefined)
 		const mockRepository = {
-			injectE2ESession: jest.fn<SignalRepositoryWithLIDStore['injectE2ESession']>()
-		} as jest.Mocked<Pick<SignalRepositoryWithLIDStore, 'injectE2ESession'>>
-
-		mockRepository.injectE2ESession.mockResolvedValue(undefined)
+			injectE2ESessions
+		} as Pick<SignalRepositoryWithLIDStore, 'injectE2ESessions'>
 
 		const createUserNode = (jid: string): BinaryNode => ({
 			tag: 'user',
@@ -55,15 +54,11 @@ describe('parseAndInjectE2ESessions', () => {
 
 		await parseAndInjectE2ESessions(mockNode, mockRepository as any)
 
-		expect(mockRepository.injectE2ESession).toHaveBeenCalledTimes(3)
-		expect(mockRepository.injectE2ESession).toHaveBeenCalledWith(
-			expect.objectContaining({ jid: 'user1@s.whatsapp.net' })
-		)
-		expect(mockRepository.injectE2ESession).toHaveBeenCalledWith(
-			expect.objectContaining({ jid: 'user2@s.whatsapp.net' })
-		)
-		expect(mockRepository.injectE2ESession).toHaveBeenCalledWith(
+		expect(injectE2ESessions).toHaveBeenCalledTimes(1)
+		expect(injectE2ESessions).toHaveBeenCalledWith([
+			expect.objectContaining({ jid: 'user1@s.whatsapp.net' }),
+			expect.objectContaining({ jid: 'user2@s.whatsapp.net' }),
 			expect.objectContaining({ jid: 'user3@s.whatsapp.net' })
-		)
+		])
 	})
 })
